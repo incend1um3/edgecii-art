@@ -374,6 +374,7 @@ dependencies = [
  "imageproc",
  "libm",
  "ndarray",
+ "num-traits",
  "rayon",
 ]
 

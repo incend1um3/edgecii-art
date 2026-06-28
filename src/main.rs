@@ -1,7 +1,9 @@
-use std::{f32, io::BufWriter};
+use std::{f32, io::BufWriter, ops::Sub};
 
 use clap::{Arg, Parser};
-use image::{ColorType, GenericImageView, GrayImage, ImageBuffer, Luma};
+use image::{ColorType, GenericImageView, GrayImage, ImageBuffer, Luma, Rgb};
+
+mod font_renderer;
 
 /// Simple program to greet a person
 #[derive(Parser, Debug)]
@@ -15,9 +17,29 @@ struct Args {
 }
 
 // dimmest to brightest
-const CHARS: [char; 3] = ['.', ',', 'A'];
+const CHARS: [char; 10] = [' ', '.', ':', '-', '=', '+', '*', '#', '%', '@'];
 // no order
-const EDGE_CHARS: [char; 6] = ['-', '/', '\\', '|', '_', '-'];
+const EDGE_CHARS: [char; 4] = ['|', '/', '_', '\\'];
+
+fn angle_to_edge_index(mut theta: f32) -> usize {
+    use f32::consts::PI;
+
+    theta = theta % PI;
+    if theta < 0.0 {
+        theta += PI
+    }
+    (theta / PI * 4.0).min(3.0) as usize
+}
+
+fn compare_slices<T>(a: &[T], b: &[T]) -> T
+where
+    T: Copy + Sub<Output = T> + std::iter::Sum + num_traits::Signed,
+{
+    a.iter()
+        .zip(b.iter())
+        .map(|(pa, pb)| (*pb - *pa).abs())
+        .sum()
+}
 
 macro_rules! join3 {
     ($a:expr, $b:expr, $c:expr) => {{
@@ -108,13 +130,10 @@ fn main() -> anyhow::Result<()> {
     }
 
     if cfg!(debug_assertions) {
-        let (data, _offset) = char_atlas.into_raw_vec_and_offset();
-        let atlas_img = GrayImage::from_raw(
-            cell_w as u32,
-            (CHARS.len() as u32 * cell_h) as u32,
-            data, // no copy
-        )
-        .expect("buffer size matches dimensions");
+        let (data, _offset) = char_atlas.clone().into_raw_vec_and_offset();
+        let atlas_img =
+            GrayImage::from_raw(cell_w as u32, (CHARS.len() as u32 * cell_h) as u32, data)
+                .expect("buffer size matches dimensions");
 
         atlas_img.save("./.debug/atlas_vertical.png")?;
     }
@@ -124,9 +143,9 @@ fn main() -> anyhow::Result<()> {
 
     let image_luma8 = image.to_luma8();
     let (vertical_grad, horizontal_grad, magnitudes) = join3!(
-        || imageproc::gradients::vertical_sobel(&dog_luma8),
-        || imageproc::gradients::horizontal_sobel(&dog_luma8),
-        || imageproc::gradients::sobel_gradients(&dog_luma8)
+        || imageproc::gradients::vertical_sobel(&image_luma8),
+        || imageproc::gradients::horizontal_sobel(&image_luma8),
+        || imageproc::gradients::sobel_gradients(&image_luma8)
     );
 
     let angles = vertical_grad
@@ -154,6 +173,32 @@ fn main() -> anyhow::Result<()> {
             Luma([v.min(255) as u8])
         })
         .save("./.debug/sobel.png")?;
+
+        ImageBuffer::from_fn(vertical_grad.width(), vertical_grad.height(), |x, y| {
+            let pixel_index = (y * image.width() + x) as usize;
+            let theta = angles[pixel_index]; // -π to π
+            let mag = magnitudes.get_pixel(x, y)[0].min(1000) as f32 / 1000.0;
+
+            let hue = (theta + f32::consts::PI) / (2.0 * f32::consts::PI); // 0..1
+            // simple HSV→RGB with S=1, V=mag
+            let h = hue * 6.0;
+            let i = h as u8;
+            let f = h - i as f32;
+            let (r, g, b) = match i % 6 {
+                0 => (1.0, f, 0.0),
+                1 => (1.0 - f, 1.0, 0.0),
+                2 => (0.0, 1.0, f),
+                3 => (0.0, 1.0 - f, 1.0),
+                4 => (f, 0.0, 1.0),
+                _ => (1.0, 0.0, 1.0 - f),
+            };
+            Rgb([
+                (r * mag * 255.0) as u8,
+                (g * mag * 255.0) as u8,
+                (b * mag * 255.0) as u8,
+            ])
+        })
+        .save("./.debug/edge_directions.png")?;
     }
 
     let img_width_snapped = (image_luma8.width() / cell_w as u32) * cell_w as u32;
@@ -165,28 +210,78 @@ fn main() -> anyhow::Result<()> {
     );
     for y in (0..(img_height_snapped)).step_by(cell_h as usize) {
         for x in (0..(img_width_snapped)).step_by(cell_w as usize) {
-            const THRESHOLD: f32 = 10.0 / 360.0 * 2.0 * f32::consts::PI;
+            const EDGE_PIXELS_THRESHOLD: f32 = 0.1;
+            let mut edge_histogram = [0u32; 4];
+            let mut char_histogram = [0; CHARS.len()];
+            let mut edge_pixels = 0;
 
             for dy in 0..(cell_h as u32) {
                 for dx in 0..(cell_w as u32) {
                     let pixel_index = ((y + dy) * image.width() + x + dx) as usize;
+                    let sobel_magnitude = magnitudes.get_pixel(x + dx, y + dy)[0];
                     let theta = angles[pixel_index];
+                    let luma = image_luma8.get_pixel(x + dx, y + dy)[0];
 
-                    if dy == cell_h - 1 && dx == cell_w - 1 {
-                        if (f32::consts::PI - theta).abs() < THRESHOLD || theta.abs() < THRESHOLD {
-                            // edge pixel
-                            chars.push('|');
-                        } else {
-                            chars.push('@');
-                        }
+                    if dog.get_pixel(x + dx, y + dy)[0] > 0.02 {
+                        edge_histogram[angle_to_edge_index(theta)] += 1;
+                        edge_pixels += 1;
+                    }
+
+                    for char_index in 0..CHARS.len() {
+                        let diff = (luma as i16
+                            - (char_atlas[[char_index, (dy * cell_w as u32 + dx) as usize]]) as i16)
+                            .abs() as u32;
+                        char_histogram[char_index] += diff;
                     }
                 }
+            }
+
+            let edge_pixels_ratio = edge_pixels as f32 / (cell_w * cell_h) as f32;
+            if edge_pixels_ratio > 0.1 {
+                chars.push(
+                    EDGE_CHARS[edge_histogram
+                        .iter()
+                        .enumerate()
+                        .max_by_key(|(_, samples)| *samples)
+                        .map(|(i, _)| i)
+                        .unwrap()],
+                );
+            } else {
+                chars.push(
+                    CHARS[char_histogram
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, diff)| *diff)
+                        .map(|(i, _)| i)
+                        .unwrap()],
+                )
             }
         }
         chars.push('\n');
     }
 
-    std::fs::write("ascii.txt", chars)?;
+    std::fs::write("ascii.txt", &chars)?;
+
+    let chars = chars.chars().filter(|&c| c != '\n').collect::<Vec<char>>();
+    GrayImage::from_fn(img_width_snapped, img_height_snapped, |x, y| {
+        let cols = img_width_snapped / cell_w;
+        let char_index = (y / cell_h) * cols + x / cell_w;
+        let char = chars[char_index as usize];
+
+        let char_index = CHARS
+            .iter()
+            .chain(EDGE_CHARS.iter())
+            .enumerate()
+            .find(|(_, c)| **c == char)
+            .map(|(i, _)| i)
+            .unwrap();
+
+        Luma([char_atlas[[
+            char_index as usize,
+            (y % cell_h * cell_w + x % cell_w) as usize,
+        ]]])
+    })
+    .save("render.png")?;
 
     // let max = gradients.pixels().map(|p| p[0]).max().unwrap();
     // let out = image::ImageBuffer::from_fn(gradients.width(), gradients.height(), |x, y| {
