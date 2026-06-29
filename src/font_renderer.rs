@@ -1,4 +1,4 @@
-use crate::{CHARS, EDGE_CHARS};
+use crate::algorithm::{CHARS, EDGE_CHARS};
 use std::sync::LazyLock;
 
 static LIB: LazyLock<freetype::Library> = LazyLock::new(|| freetype::Library::init().unwrap());

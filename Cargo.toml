@@ -9,11 +9,13 @@ clap = { version = "4.6.1", features = ["derive"] }
 freetype-rs = { version = "0.38.0", features = ["bundled"] }
 image = "0.25.10"
 imageproc = "0.27.0"
+infer = "0.19.0"
 libm = "0.2.16"
 linear-srgb = "0.6.12"
 ndarray = "0.17.2"
 num-traits = "0.2.19"
 rayon = "1.12.0"
+video-rs = { version = "0.11.0", features = ["ndarray"] }
 
 [profile.dev]
 opt-level = 1
