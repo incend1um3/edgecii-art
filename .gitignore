@@ -1,5 +1,3 @@
 /target
-.debug
-/test.png
-/ascii.txt
-/render.png
+/.debug
+/output

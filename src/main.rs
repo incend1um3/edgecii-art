@@ -1,26 +1,29 @@
-use clap::{Arg, Parser};
-use image::{ColorType, GenericImageView, GrayImage, ImageBuffer, Luma, Rgb};
+use clap::Parser;
+use image::{GenericImageView, GrayImage, ImageBuffer, Luma, Rgb};
 use linear_srgb::{default::linear_to_srgb, tf::srgb_to_linear};
-use num_traits::Pow;
-use std::{f32, io::BufWriter, ops::Sub};
+use std::{f32, ffi::OsString, ops::Sub};
+
+use crate::font_renderer::render_fonts_to_atlas;
 
 mod font_renderer;
 
-/// Simple program to greet a person
+/// Convert images to ascii art with edge detection.
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
+    /// Path to image file
     #[arg(short, long)]
-    image: String,
+    image: OsString,
 
+    /// Height of characters passed to FreeType (this may be different from the actual height of rendered cells)
     #[arg(short, long)]
     char_height: u8,
 }
 
 // dimmest to brightest
-const CHARS: [char; 9] = [' ', '.', ':', '=', '+', '*', '#', '%', '@'];
+pub const CHARS: [char; 9] = [' ', '.', ':', '=', '+', '*', '#', '%', '@'];
 // no order
-const EDGE_CHARS: [char; 4] = ['|', '/', '_', '\\'];
+pub const EDGE_CHARS: [char; 4] = ['|', '/', '_', '\\'];
 
 fn angle_to_edge_index(theta: f32) -> usize {
     use f32::consts::PI;
@@ -29,7 +32,7 @@ fn angle_to_edge_index(theta: f32) -> usize {
     (t / PI * 4.0) as usize % 4
 }
 
-fn compare_slices<T>(a: &[T], b: &[T]) -> T
+fn _compare_slices<T>(a: &[T], b: &[T]) -> T
 where
     T: Copy + Sub<Output = T> + std::iter::Sum + num_traits::Signed,
 {
@@ -81,52 +84,14 @@ fn main() -> anyhow::Result<()> {
 
     if cfg!(debug_assertions) {
         let _ = std::fs::create_dir("./.debug");
+        let _ = std::fs::create_dir("./output");
     }
 
     let file_bytes = std::fs::read(args.image)?;
     let image = image::load_from_memory(&file_bytes)?;
     let image_luma_f32 = image.to_luma32f();
 
-    let lib = freetype::Library::init()?;
-    let face = lib.new_face("FiraSans-SemiBold.ttf", 0)?;
-    face.set_pixel_sizes(0, args.char_height as u32)?;
-
-    let size_metrics = face.size_metrics().unwrap();
-    let ascender = (size_metrics.ascender >> 6) as i32;
-    let cell_w = (size_metrics.max_advance >> 6) as u32;
-    let cell_h = (size_metrics.height >> 6) as u32;
-
-    // holds rendered font bitmaps
-    let mut char_atlas: ndarray::Array2<u8> =
-        ndarray::Array2::zeros((CHARS.len() + EDGE_CHARS.len(), (cell_h * cell_w) as usize));
-
-    // https://freetype.org/freetype2/docs/tutorial/step2.html
-    for (i, c) in CHARS.iter().chain(EDGE_CHARS.iter()).enumerate() {
-        face.load_char(*c as usize, freetype::face::LoadFlag::RENDER)?;
-        let glyph = face.glyph();
-        let bitmap = glyph.bitmap();
-
-        let buf = bitmap.buffer();
-        let height = bitmap.rows() as i32;
-        let width = bitmap.width() as i32;
-        let left = glyph.bitmap_left() as i32;
-        let top = glyph.bitmap_top() as i32;
-        let advance = (glyph.advance().x >> 6) as i32;
-
-        let mut j = 0;
-        let y_offset = if ascender > top { ascender - top } else { 0 };
-        let x_offset = (cell_w as i32 - advance) / 2;
-        for y in 0..height {
-            for x in 0..width {
-                let ty = y_offset + y;
-                let tx = left + x_offset + x;
-                if ty >= 0 && (ty as u32) < cell_h && tx >= 0 && (tx as u32) < cell_w {
-                    char_atlas[[i, (ty * cell_w as i32 + tx) as usize]] = buf[j];
-                }
-                j += 1;
-            }
-        }
-    }
+    let (char_atlas, cell_w, cell_h) = render_fonts_to_atlas(args.char_height as u32)?;
 
     if cfg!(debug_assertions) {
         let (data, _offset) = char_atlas.clone().into_raw_vec_and_offset();
@@ -140,21 +105,27 @@ fn main() -> anyhow::Result<()> {
         atlas_img.save("./.debug/atlas_vertical.png")?;
     }
 
-    let dog = difference_of_gaussians(&image_luma_f32, 1.5, 1.6 * 1.5);
-    let dog_luma8 = luma_f32_to_u8(&dog);
-
     let image_luma8 = image.to_luma8();
-    let (vertical_grad, horizontal_grad, magnitudes) = join3!(
+    let (dog, vertical_grad, horizontal_grad) = join3!(
+        || difference_of_gaussians(&image_luma_f32, 1.5, 1.6 * 1.5),
         || imageproc::gradients::vertical_sobel(&image_luma8),
-        || imageproc::gradients::horizontal_sobel(&image_luma8),
-        || imageproc::gradients::sobel_gradients(&image_luma8)
+        || imageproc::gradients::horizontal_sobel(&image_luma8)
     );
-
-    let angles = vertical_grad
-        .pixels()
-        .zip(horizontal_grad.pixels())
-        .map(|(y, x)| libm::atan2f(y[0] as f32, x[0] as f32))
-        .collect::<Vec<f32>>();
+    let (dog_luma8, magnitudes, angles) = join3!(
+        || luma_f32_to_u8(&dog),
+        || {
+            ImageBuffer::from_fn(vertical_grad.width(), vertical_grad.height(), |x, y| {
+                let v = vertical_grad.get_pixel(x, y)[0] as f32;
+                let h = horizontal_grad.get_pixel(x, y)[0] as f32;
+                Luma([(v.powf(2.0) + h.powf(2.0)).sqrt().round() as u16])
+            })
+        },
+        || vertical_grad
+            .pixels()
+            .zip(horizontal_grad.pixels())
+            .map(|(y, x)| libm::atan2f(y[0] as f32, x[0] as f32))
+            .collect::<Vec<f32>>()
+    );
 
     if cfg!(debug_assertions) {
         let angles_img = GrayImage::from_vec(
@@ -271,7 +242,7 @@ fn main() -> anyhow::Result<()> {
         chars.push('\n');
     }
 
-    std::fs::write("ascii.txt", &chars)?;
+    std::fs::write("./output/ascii.txt", &chars)?;
 
     let chars = chars.chars().filter(|&c| c != '\n').collect::<Vec<char>>();
     ImageBuffer::from_fn(img_width_snapped, img_height_snapped, |x, y| {
@@ -301,14 +272,7 @@ fn main() -> anyhow::Result<()> {
             (pixel[2] as f32 / 255.0 * text_multiplier * 255.0).round() as u8,
         ])
     })
-    .save("render.png")?;
-
-    // let max = gradients.pixels().map(|p| p[0]).max().unwrap();
-    // let out = image::ImageBuffer::from_fn(gradients.width(), gradients.height(), |x, y| {
-    //     let p = gradients.get_pixel(x, y)[0];
-    //     image::Luma([((p as f32 / max as f32) * 255.0) as u8]) // scale u16 → u8
-    // });
-    // out.save("./out.png")?;
+    .save("./output/render.png")?;
 
     Ok(())
 }
