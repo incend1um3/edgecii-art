@@ -1,7 +1,8 @@
-use std::{f32, io::BufWriter, ops::Sub};
-
 use clap::{Arg, Parser};
 use image::{ColorType, GenericImageView, GrayImage, ImageBuffer, Luma, Rgb};
+use linear_srgb::{default::linear_to_srgb, tf::srgb_to_linear};
+use num_traits::Pow;
+use std::{f32, io::BufWriter, ops::Sub};
 
 mod font_renderer;
 
@@ -17,18 +18,15 @@ struct Args {
 }
 
 // dimmest to brightest
-const CHARS: [char; 10] = [' ', '.', ':', '-', '=', '+', '*', '#', '%', '@'];
+const CHARS: [char; 9] = [' ', '.', ':', '=', '+', '*', '#', '%', '@'];
 // no order
 const EDGE_CHARS: [char; 4] = ['|', '/', '_', '\\'];
 
-fn angle_to_edge_index(mut theta: f32) -> usize {
+fn angle_to_edge_index(theta: f32) -> usize {
     use f32::consts::PI;
 
-    theta = theta % PI;
-    if theta < 0.0 {
-        theta += PI
-    }
-    (theta / PI * 4.0).min(3.0) as usize
+    let t = (theta.rem_euclid(PI) + PI / 8.0) % PI; // shift by half a bin
+    (t / PI * 4.0) as usize % 4
 }
 
 fn compare_slices<T>(a: &[T], b: &[T]) -> T
@@ -90,7 +88,7 @@ fn main() -> anyhow::Result<()> {
     let image_luma_f32 = image.to_luma32f();
 
     let lib = freetype::Library::init()?;
-    let face = lib.new_face("FiraSans-Regular.ttf", 0)?;
+    let face = lib.new_face("FiraSans-SemiBold.ttf", 0)?;
     face.set_pixel_sizes(0, args.char_height as u32)?;
 
     let size_metrics = face.size_metrics().unwrap();
@@ -120,10 +118,11 @@ fn main() -> anyhow::Result<()> {
         let x_offset = (cell_w as i32 - advance) / 2;
         for y in 0..height {
             for x in 0..width {
-                char_atlas[[
-                    i,
-                    ((y_offset + y) * cell_w as i32 + left + x_offset + x) as usize,
-                ]] = buf[j];
+                let ty = y_offset + y;
+                let tx = left + x_offset + x;
+                if ty >= 0 && (ty as u32) < cell_h && tx >= 0 && (tx as u32) < cell_w {
+                    char_atlas[[i, (ty * cell_w as i32 + tx) as usize]] = buf[j];
+                }
                 j += 1;
             }
         }
@@ -131,9 +130,12 @@ fn main() -> anyhow::Result<()> {
 
     if cfg!(debug_assertions) {
         let (data, _offset) = char_atlas.clone().into_raw_vec_and_offset();
-        let atlas_img =
-            GrayImage::from_raw(cell_w as u32, (CHARS.len() as u32 * cell_h) as u32, data)
-                .expect("buffer size matches dimensions");
+        let atlas_img = GrayImage::from_raw(
+            cell_w as u32,
+            ((CHARS.len() + EDGE_CHARS.len()) as u32 * cell_h) as u32,
+            data,
+        )
+        .expect("buffer size matches dimensions");
 
         atlas_img.save("./.debug/atlas_vertical.png")?;
     }
@@ -165,8 +167,10 @@ fn main() -> anyhow::Result<()> {
         )
         .expect("Vector size matches width * height");
 
-        angles_img.save("./.debug/angles.png")?;
-        dog_luma8.save("./.debug/dog.png")?;
+        rayon::join(
+            || angles_img.save("./.debug/angles.png").unwrap(),
+            || dog_luma8.save("./.debug/dog.png").unwrap(),
+        );
 
         ImageBuffer::from_fn(magnitudes.width(), magnitudes.height(), |x, y| {
             let Luma([v]) = *magnitudes.get_pixel(x, y);
@@ -214,13 +218,14 @@ fn main() -> anyhow::Result<()> {
             let mut edge_histogram = [0u32; 4];
             let mut char_histogram = [0; CHARS.len()];
             let mut edge_pixels = 0;
+            let mut brightness_sum = 0.0;
 
             for dy in 0..(cell_h as u32) {
                 for dx in 0..(cell_w as u32) {
                     let pixel_index = ((y + dy) * image.width() + x + dx) as usize;
-                    let sobel_magnitude = magnitudes.get_pixel(x + dx, y + dy)[0];
                     let theta = angles[pixel_index];
-                    let luma = image_luma8.get_pixel(x + dx, y + dy)[0];
+
+                    brightness_sum += srgb_to_linear(image_luma_f32.get_pixel(x + dx, y + dy)[0]);
 
                     if dog.get_pixel(x + dx, y + dy)[0] > 0.02 {
                         edge_histogram[angle_to_edge_index(theta)] += 1;
@@ -228,7 +233,7 @@ fn main() -> anyhow::Result<()> {
                     }
 
                     for char_index in 0..CHARS.len() {
-                        let diff = (luma as i16
+                        let diff = (image_luma8.get_pixel(x + dx, y + dy)[0] as i16
                             - (char_atlas[[char_index, (dy * cell_w as u32 + dx) as usize]]) as i16)
                             .abs() as u32;
                         char_histogram[char_index] += diff;
@@ -237,7 +242,7 @@ fn main() -> anyhow::Result<()> {
             }
 
             let edge_pixels_ratio = edge_pixels as f32 / (cell_w * cell_h) as f32;
-            if edge_pixels_ratio > 0.1 {
+            if edge_pixels_ratio > EDGE_PIXELS_THRESHOLD {
                 chars.push(
                     EDGE_CHARS[edge_histogram
                         .iter()
@@ -247,14 +252,20 @@ fn main() -> anyhow::Result<()> {
                         .unwrap()],
                 );
             } else {
+                // chars.push(
+                //     CHARS[char_histogram
+                //         .iter()
+                //         .enumerate()
+                //         .min_by_key(|(_, diff)| *diff)
+                //         .map(|(i, _)| i)
+                //         .unwrap()],
+                // )
+
+                let brightness_avg = brightness_sum / (cell_w * cell_h) as f32 * 1.1;
                 chars.push(
-                    CHARS[char_histogram
-                        .iter()
-                        .enumerate()
-                        .min_by_key(|(_, diff)| *diff)
-                        .map(|(i, _)| i)
-                        .unwrap()],
-                )
+                    CHARS[((linear_to_srgb(brightness_avg)) * (CHARS.len() - 1) as f32).round()
+                        as usize],
+                );
             }
         }
         chars.push('\n');
@@ -263,7 +274,7 @@ fn main() -> anyhow::Result<()> {
     std::fs::write("ascii.txt", &chars)?;
 
     let chars = chars.chars().filter(|&c| c != '\n').collect::<Vec<char>>();
-    GrayImage::from_fn(img_width_snapped, img_height_snapped, |x, y| {
+    ImageBuffer::from_fn(img_width_snapped, img_height_snapped, |x, y| {
         let cols = img_width_snapped / cell_w;
         let char_index = (y / cell_h) * cols + x / cell_w;
         let char = chars[char_index as usize];
@@ -276,10 +287,19 @@ fn main() -> anyhow::Result<()> {
             .map(|(i, _)| i)
             .unwrap();
 
-        Luma([char_atlas[[
+        let pixel = image.get_pixel(x, y);
+        let text_multiplier = (char_atlas[[
             char_index as usize,
             (y % cell_h * cell_w + x % cell_w) as usize,
-        ]]])
+        ]] as f32
+            / 255.0)
+            .sqrt();
+
+        Rgb([
+            (pixel[0] as f32 / 255.0 * text_multiplier * 255.0).round() as u8,
+            (pixel[1] as f32 / 255.0 * text_multiplier * 255.0).round() as u8,
+            (pixel[2] as f32 / 255.0 * text_multiplier * 255.0).round() as u8,
+        ])
     })
     .save("render.png")?;
 
