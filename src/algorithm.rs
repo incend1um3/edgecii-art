@@ -1,10 +1,6 @@
 use crate::{join3, util::luma_f32_to_u8};
 use image::{DynamicImage, GenericImageView, GrayImage, ImageBuffer, Luma, Rgb};
 use linear_srgb::{default::linear_to_srgb, tf::srgb_to_linear};
-use rayon::iter::IntoParallelIterator;
-use rayon::iter::{IndexedParallelIterator, ParallelIterator};
-use std::cell::LazyCell;
-use std::sync::LazyLock;
 use std::{f32, ffi::OsString, ops::Sub, process};
 
 // dimmest to brightest
@@ -29,9 +25,9 @@ pub fn difference_of_gaussians(
 
     let (blur1, blur2) = {
         profiling::scope!("fast_blur");
-        rayon::join(
-            || image::imageops::fast_blur(img, sigma1),
-            || image::imageops::fast_blur(img, sigma2),
+        (
+            image::imageops::fast_blur(img, sigma1),
+            image::imageops::fast_blur(img, sigma2),
         )
     };
 
@@ -56,17 +52,21 @@ pub fn process_frame(
     let image_luma8 = image.to_luma8();
     let image_luma_f32 = image.to_luma32f();
 
-    let (dog, vertical_grad, horizontal_grad) = {
-        profiling::scope!("DoG + Sobel");
-        join3!(
-            || difference_of_gaussians(&image_luma_f32, 1.4, 1.6 * 1.4),
-            || imageproc::gradients::vertical_sobel(&image_luma8),
-            || imageproc::gradients::horizontal_sobel(&image_luma8)
-        )
+    let dog = {
+        profiling::scope!("DoG");
+        difference_of_gaussians(&image_luma_f32, 1.4, 1.6 * 1.4)
+    };
+    let vertical_grad = {
+        profiling::scope!("Vertical Sobel");
+        imageproc::gradients::vertical_sobel(&image_luma8)
+    };
+    let horizontal_grad = {
+        profiling::scope!("Horizontal Sobel");
+        imageproc::gradients::horizontal_sobel(&image_luma8)
     };
 
     let dog_luma8 = {
-        profiling::scope!("DoG cast + Sobel Magnitudes and Angles");
+        profiling::scope!("DoG Cast");
         luma_f32_to_u8(&dog)
     };
 
@@ -129,15 +129,10 @@ pub fn process_frame(
     let img_width_snapped = (image_luma8.width() / cell_w as u32) * cell_w as u32;
     let img_height_snapped = (image_luma8.height() / cell_h as u32) * cell_h as u32;
 
-    // let mut chars = String::with_capacity(
-    //     img_width_snapped as usize / cell_w as usize * img_height_snapped as usize
-    //         / cell_h as usize,
-    // );
-
     let char_indices = {
         profiling::scope!("Conversion Loop");
         (0..(img_height_snapped))
-            .into_par_iter()
+            .into_iter()
             .step_by(cell_h as usize)
             .map(|y| {
                 let mut char_indices = Vec::with_capacity(cell_w as usize);
@@ -152,18 +147,18 @@ pub fn process_frame(
                     for dy in 0..(cell_h as u32) {
                         for dx in 0..(cell_w as u32) {
                             // let pixel_index = ((y + dy) * image.width() + x + dx) as usize;
-                            let theta = unsafe {
-                                libm::atan2f(
-                                    vertical_grad.unsafe_get_pixel(x + dx, y + dy)[0] as f32,
-                                    horizontal_grad.unsafe_get_pixel(x + dx, y + dy)[0] as f32,
-                                )
-                            };
-
                             brightness_sum += unsafe {
                                 srgb_to_linear(image_luma_f32.unsafe_get_pixel(x + dx, y + dy)[0])
                             };
 
                             if unsafe { dog.unsafe_get_pixel(x + dx, y + dy)[0] } > 0.025 {
+                                let theta = unsafe {
+                                    libm::atan2f(
+                                        vertical_grad.unsafe_get_pixel(x + dx, y + dy)[0] as f32,
+                                        horizontal_grad.unsafe_get_pixel(x + dx, y + dy)[0] as f32,
+                                    )
+                                };
+
                                 edge_histogram[angle_to_edge_index(theta)] += 1;
                                 edge_pixels += 1;
                             }

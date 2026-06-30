@@ -1,8 +1,10 @@
 use clap::Parser;
 use image::{DynamicImage, GenericImageView, GrayImage, ImageBuffer, Luma, Rgb};
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 use std::{
     ops::Sub,
@@ -54,13 +56,21 @@ static FRAMES_IN_QUEUE: AtomicU32 = AtomicU32::new(0);
 
 enum DecoderThreadOutput {
     Data {
+        id: u32,
         timestamp: video_rs::Time,
         frame: ndarray::Array3<u8>,
     },
     End,
 }
 
+struct ProcessedFrame {
+    id: u32,
+    timestamp: video_rs::Time,
+    frame: ndarray::Array3<u8>,
+}
+
 fn decode_thread(mut decoder: Decoder, mut tx: spmc::Sender<DecoderThreadOutput>) {
+    let mut id = 0u32;
     for frame in decoder.decode_iter() {
         let (timestamp, frame) = match frame {
             Ok(f) => f,
@@ -68,15 +78,86 @@ fn decode_thread(mut decoder: Decoder, mut tx: spmc::Sender<DecoderThreadOutput>
         };
 
         while FRAMES_IN_QUEUE.load(Ordering::Relaxed) > 24 {
-            std::thread::sleep(Duration::from_millis(500));
+            std::thread::sleep(Duration::from_millis(400));
         }
 
-        tx.send(DecoderThreadOutput::Data { timestamp, frame })
-            .unwrap();
+        tx.send(DecoderThreadOutput::Data {
+            id,
+            timestamp,
+            frame,
+        })
+        .unwrap();
+
         FRAMES_IN_QUEUE.fetch_add(1, Ordering::Relaxed);
+        id += 1;
     }
 
     tx.send(DecoderThreadOutput::End).unwrap();
+}
+
+fn encode_thread(mut encoder: Encoder, rx: mpsc::Receiver<ProcessedFrame>) {
+    let mut queue = HashMap::<u32, ProcessedFrame>::new();
+    let mut next = 0u32;
+
+    while let Ok(data) = rx.recv() {
+        queue.insert(data.id, data);
+
+        while let Some(data) = queue.remove(&next) {
+            profiling::scope!("Encode");
+            encoder.encode(&data.frame, data.timestamp).unwrap();
+            profiling::finish_frame!();
+
+            FRAMES_IN_QUEUE.fetch_sub(1, Ordering::Relaxed);
+            next += 1;
+
+            if next % 30 == 0 {
+                print!("Processed {} frames\r", next);
+                std::io::stdout().flush().unwrap();
+            }
+        }
+    }
+
+    encoder.finish().unwrap();
+}
+
+fn process_thread(
+    char_atlas: Arc<ndarray::Array2<u8>>,
+    cell_w: u32,
+    cell_h: u32,
+    out_w: u32,
+    out_h: u32,
+    rx: spmc::Receiver<DecoderThreadOutput>,
+    tx: mpsc::Sender<ProcessedFrame>,
+) {
+    loop {
+        let (id, timestamp, frame) = {
+            profiling::scope!("Wait for Decode");
+            match rx.recv().unwrap() {
+                DecoderThreadOutput::Data {
+                    id,
+                    timestamp,
+                    frame,
+                } => (id, timestamp, frame),
+                DecoderThreadOutput::End => break,
+            }
+        };
+
+        let image = DynamicImage::ImageRgb8(video_frame_to_image(&frame));
+
+        let (_, render) = {
+            profiling::scope!("Process Frame");
+            algorithm::process_frame(&char_atlas, image, cell_w, cell_h, false).unwrap()
+        };
+
+        let render = image::imageops::crop_imm(&render.to_rgb8(), 0, 0, out_w, out_h).to_image();
+
+        tx.send(ProcessedFrame {
+            id,
+            timestamp,
+            frame: image_to_frame(&render),
+        })
+        .unwrap();
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -128,6 +209,7 @@ fn main() -> anyhow::Result<()> {
         image.save("./output/image.png")?;
     } else {
         let (decode_tx, decode_rx) = spmc::channel();
+        let (encode_tx, encode_rx) = mpsc::channel();
 
         let decoder = DecoderBuilder::new(args.input)
             .with_hardware_acceleration(video_rs::hwaccel::HardwareAccelerationDeviceType::VaApi)
@@ -139,7 +221,7 @@ fn main() -> anyhow::Result<()> {
         let out_w = ((src_w / cell_w) * cell_w) & !1;
         let out_h = ((src_h / cell_h) * cell_h) & !1;
 
-        let mut encoder = Encoder::new(
+        let encoder = Encoder::new(
             PathBuf::from_str("./output/render.mkv")?,
             video_rs::encode::Settings::preset_h264_custom(
                 out_w as usize,
@@ -149,44 +231,24 @@ fn main() -> anyhow::Result<()> {
             ),
         )?;
 
-        let mut frames_processed = 0;
-        loop {
-            let (timestamp, frame) = {
-                profiling::scope!("Wait for Decode");
-                match decode_rx.recv()? {
-                    DecoderThreadOutput::Data { timestamp, frame } => (timestamp, frame),
-                    DecoderThreadOutput::End => break,
-                }
-            };
+        let encoder_handle = std::thread::spawn(move || encode_thread(encoder, encode_rx));
 
-            let image = DynamicImage::ImageRgb8(video_frame_to_image(&frame));
+        let char_atlas = Arc::new(char_atlas);
+        let worker_handles: Vec<_> = (0..std::thread::available_parallelism().unwrap().get() - 2)
+            .map(|_| {
+                let rx = decode_rx.clone();
+                let tx = encode_tx.clone();
+                let atlas = Arc::clone(&char_atlas);
+                std::thread::spawn(move || {
+                    process_thread(atlas, cell_w, cell_h, out_w, out_h, rx, tx)
+                })
+            })
+            .collect();
 
-            let (_, render) = {
-                profiling::scope!("Process Frame");
-                algorithm::process_frame(&char_atlas, image, cell_w, cell_h, false)?
-            };
-
-            let render =
-                image::imageops::crop_imm(&render.to_rgb8(), 0, 0, out_w, out_h).to_image();
-
-            {
-                profiling::scope!("Encode");
-                encoder.encode(&image_to_frame(&render), timestamp)?;
-            }
-
-            frames_processed += 1;
-            FRAMES_IN_QUEUE.fetch_sub(1, Ordering::Relaxed);
-
-            profiling::finish_frame!();
-
-            if frames_processed % 30 == 0 {
-                print!("Frames processed: {}\r", frames_processed);
-                io::stdout().flush()?;
-            }
-        }
-
-        encoder.finish()?;
         decoder_handle.join().unwrap();
+        worker_handles.into_iter().for_each(|h| h.join().unwrap());
+        encoder_handle.join().unwrap();
+
         println!("Done");
     }
 
