@@ -113,8 +113,16 @@ fn main() -> anyhow::Result<()> {
 
     if !is_video {
         let image = image::load_from_memory(&file_bytes)?;
-        let (chars, image) =
+
+        let (char_indices, image) =
             algorithm::process_frame(&char_atlas, image, cell_w, cell_h, cfg!(debug_assertions))?;
+        let chars = algorithm::char_indices_to_string(
+            cell_w as usize,
+            cell_h as usize,
+            image.width() as usize,
+            image.height() as usize,
+            &char_indices,
+        );
 
         print!("{}", chars);
         image.save("./output/image.png")?;
