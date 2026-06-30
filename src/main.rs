@@ -2,6 +2,8 @@ use clap::Parser;
 use image::{DynamicImage, GenericImageView, GrayImage, ImageBuffer, Luma, Rgb};
 use std::io::{self, Write};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
 use std::{
     ops::Sub,
     path::{Path, PathBuf},
@@ -48,6 +50,35 @@ where
         .sum()
 }
 
+static FRAMES_IN_QUEUE: AtomicU32 = AtomicU32::new(0);
+
+enum DecoderThreadOutput {
+    Data {
+        timestamp: video_rs::Time,
+        frame: ndarray::Array3<u8>,
+    },
+    End,
+}
+
+fn decode_thread(mut decoder: Decoder, mut tx: spmc::Sender<DecoderThreadOutput>) {
+    for frame in decoder.decode_iter() {
+        let (timestamp, frame) = match frame {
+            Ok(f) => f,
+            Err(_) => break,
+        };
+
+        while FRAMES_IN_QUEUE.load(Ordering::Relaxed) > 24 {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+
+        tx.send(DecoderThreadOutput::Data { timestamp, frame })
+            .unwrap();
+        FRAMES_IN_QUEUE.fetch_add(1, Ordering::Relaxed);
+    }
+
+    tx.send(DecoderThreadOutput::End).unwrap();
+}
+
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
@@ -88,8 +119,14 @@ fn main() -> anyhow::Result<()> {
         print!("{}", chars);
         image.save("./output/image.png")?;
     } else {
-        let mut decoder = Decoder::new(args.input)?;
+        let (decode_tx, decode_rx) = spmc::channel();
+
+        let decoder = DecoderBuilder::new(args.input)
+            .with_hardware_acceleration(video_rs::hwaccel::HardwareAccelerationDeviceType::VaApi)
+            .build()?;
         let (src_w, src_h) = decoder.size();
+
+        let decoder_handle = std::thread::spawn(move || decode_thread(decoder, decode_tx));
 
         let out_w = ((src_w / cell_w) * cell_w) & !1;
         let out_h = ((src_h / cell_h) * cell_h) & !1;
@@ -105,19 +142,34 @@ fn main() -> anyhow::Result<()> {
         )?;
 
         let mut frames_processed = 0;
-        for frame in decoder.decode_iter() {
-            let (timestamp, frame) = match frame {
-                Ok(f) => f,
-                Err(_) => break,
+        loop {
+            let (timestamp, frame) = {
+                profiling::scope!("Wait for Decode");
+                match decode_rx.recv()? {
+                    DecoderThreadOutput::Data { timestamp, frame } => (timestamp, frame),
+                    DecoderThreadOutput::End => break,
+                }
             };
 
             let image = DynamicImage::ImageRgb8(video_frame_to_image(&frame));
-            let (_, render) = algorithm::process_frame(&char_atlas, image, cell_w, cell_h, false)?;
+
+            let (_, render) = {
+                profiling::scope!("Process Frame");
+                algorithm::process_frame(&char_atlas, image, cell_w, cell_h, false)?
+            };
+
             let render =
                 image::imageops::crop_imm(&render.to_rgb8(), 0, 0, out_w, out_h).to_image();
 
-            encoder.encode(&image_to_frame(&render), timestamp)?;
+            {
+                profiling::scope!("Encode");
+                encoder.encode(&image_to_frame(&render), timestamp)?;
+            }
+
             frames_processed += 1;
+            FRAMES_IN_QUEUE.fetch_sub(1, Ordering::Relaxed);
+
+            profiling::finish_frame!();
 
             if frames_processed % 30 == 0 {
                 print!("Frames processed: {}\r", frames_processed);
@@ -126,6 +178,7 @@ fn main() -> anyhow::Result<()> {
         }
 
         encoder.finish()?;
+        decoder_handle.join().unwrap();
         println!("Done");
     }
 

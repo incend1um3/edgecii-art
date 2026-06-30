@@ -38,6 +38,7 @@ pub fn difference_of_gaussians(
     ImageBuffer::from_raw(img.width(), img.height(), raw).unwrap()
 }
 
+#[profiling::function]
 pub fn process_frame(
     char_atlas: &ndarray::Array2<u8>,
     image: DynamicImage,
@@ -48,27 +49,33 @@ pub fn process_frame(
     let image_luma8 = image.to_luma8();
     let image_luma_f32 = image.to_luma32f();
 
-    let (dog, vertical_grad, horizontal_grad) = join3!(
-        || difference_of_gaussians(&image_luma_f32, 1.5, 1.6 * 1.5),
-        || imageproc::gradients::vertical_sobel(&image_luma8),
-        || imageproc::gradients::horizontal_sobel(&image_luma8)
-    );
+    let (dog, vertical_grad, horizontal_grad) = {
+        profiling::scope!("DoG + Sobel");
+        join3!(
+            || difference_of_gaussians(&image_luma_f32, 1.5, 1.6 * 1.5),
+            || imageproc::gradients::vertical_sobel(&image_luma8),
+            || imageproc::gradients::horizontal_sobel(&image_luma8)
+        )
+    };
 
-    let (dog_luma8, magnitudes, angles) = join3!(
-        || luma_f32_to_u8(&dog),
-        || {
-            ImageBuffer::from_fn(vertical_grad.width(), vertical_grad.height(), |x, y| {
-                let v = vertical_grad.get_pixel(x, y)[0] as f32;
-                let h = horizontal_grad.get_pixel(x, y)[0] as f32;
-                Luma([(v * v + h * h).sqrt().round() as u16])
-            })
-        },
-        || vertical_grad
-            .pixels()
-            .zip(horizontal_grad.pixels())
-            .map(|(y, x)| libm::atan2f(y[0] as f32, x[0] as f32))
-            .collect::<Vec<f32>>()
-    );
+    let (dog_luma8, magnitudes, angles) = {
+        profiling::scope!("DoG cast + Sobel Magnitudes and Angles");
+        join3!(
+            || luma_f32_to_u8(&dog),
+            || {
+                ImageBuffer::from_fn(vertical_grad.width(), vertical_grad.height(), |x, y| {
+                    let v = vertical_grad.get_pixel(x, y)[0] as f32;
+                    let h = horizontal_grad.get_pixel(x, y)[0] as f32;
+                    Luma([(v * v + h * h).sqrt().round() as u16])
+                })
+            },
+            || vertical_grad
+                .pixels()
+                .zip(horizontal_grad.pixels())
+                .map(|(y, x)| libm::atan2f(y[0] as f32, x[0] as f32))
+                .collect::<Vec<f32>>()
+        )
+    };
 
     if debug_output {
         let angles_img = GrayImage::from_vec(
@@ -127,93 +134,109 @@ pub fn process_frame(
     //         / cell_h as usize,
     // );
 
-    let chars: String = (0..(img_height_snapped))
-        .into_par_iter()
-        .step_by(cell_h as usize)
-        .map(|y| {
-            let mut chars = String::with_capacity(cell_w as usize);
+    let chars: String = {
+        profiling::scope!("Conversion Loop");
+        (0..(img_height_snapped))
+            .into_par_iter()
+            .step_by(cell_h as usize)
+            .map(|y| {
+                let mut chars = String::with_capacity(cell_w as usize);
 
-            for x in (0..(img_width_snapped)).step_by(cell_w as usize) {
-                const EDGE_PIXELS_THRESHOLD: f32 = 0.1;
-                let mut edge_histogram = [0u32; 4];
-                // let mut char_histogram = [0; CHARS.len()];
-                let mut edge_pixels = 0;
-                let mut brightness_sum = 0.0;
+                for x in (0..(img_width_snapped)).step_by(cell_w as usize) {
+                    const EDGE_PIXELS_THRESHOLD: f32 = 0.1;
+                    let mut edge_histogram = [0u32; 4];
+                    // let mut char_histogram = [0; CHARS.len()];
+                    let mut edge_pixels = 0;
+                    let mut brightness_sum = 0.0;
 
-                for dy in 0..(cell_h as u32) {
-                    for dx in 0..(cell_w as u32) {
-                        let pixel_index = ((y + dy) * image.width() + x + dx) as usize;
-                        let theta = angles[pixel_index];
+                    for dy in 0..(cell_h as u32) {
+                        for dx in 0..(cell_w as u32) {
+                            let pixel_index = ((y + dy) * image.width() + x + dx) as usize;
+                            let theta = angles[pixel_index];
 
-                        brightness_sum +=
-                            srgb_to_linear(image_luma_f32.get_pixel(x + dx, y + dy)[0]);
+                            brightness_sum += unsafe {
+                                srgb_to_linear(image_luma_f32.unsafe_get_pixel(x + dx, y + dy)[0])
+                            };
 
-                        if unsafe { dog.unsafe_get_pixel(x + dx, y + dy)[0] } > 0.02 {
-                            edge_histogram[angle_to_edge_index(theta)] += 1;
-                            edge_pixels += 1;
+                            if unsafe { dog.unsafe_get_pixel(x + dx, y + dy)[0] } > 0.02 {
+                                edge_histogram[angle_to_edge_index(theta)] += 1;
+                                edge_pixels += 1;
+                            }
+
+                            // for char_index in 0..CHARS.len() {
+                            //     let diff = (image_luma8.get_pixel(x + dx, y + dy)[0] as i16
+                            //         - (char_atlas[[char_index, (dy * cell_w as u32 + dx) as usize]]) as i16)
+                            //         .abs() as u32;
+                            //     char_histogram[char_index] += diff;
+                            // }
                         }
+                    }
 
-                        // for char_index in 0..CHARS.len() {
-                        //     let diff = (image_luma8.get_pixel(x + dx, y + dy)[0] as i16
-                        //         - (char_atlas[[char_index, (dy * cell_w as u32 + dx) as usize]]) as i16)
-                        //         .abs() as u32;
-                        //     char_histogram[char_index] += diff;
-                        // }
+                    let edge_pixels_ratio = edge_pixels as f32 / (cell_w * cell_h) as f32;
+                    if edge_pixels_ratio > EDGE_PIXELS_THRESHOLD {
+                        chars.push(
+                            EDGE_CHARS[edge_histogram
+                                .iter()
+                                .enumerate()
+                                .max_by_key(|(_, samples)| *samples)
+                                .map(|(i, _)| i)
+                                .unwrap()],
+                        );
+                    } else {
+                        let brightness_avg = brightness_sum / (cell_w * cell_h) as f32;
+                        chars.push(
+                            CHARS[((linear_to_srgb(brightness_avg)) * (CHARS.len() - 1) as f32)
+                                .round() as usize],
+                        );
                     }
                 }
+                chars.push('\n');
 
-                let edge_pixels_ratio = edge_pixels as f32 / (cell_w * cell_h) as f32;
-                if edge_pixels_ratio > EDGE_PIXELS_THRESHOLD {
-                    chars.push(
-                        EDGE_CHARS[edge_histogram
-                            .iter()
-                            .enumerate()
-                            .max_by_key(|(_, samples)| *samples)
-                            .map(|(i, _)| i)
-                            .unwrap()],
-                    );
-                } else {
-                    let brightness_avg = brightness_sum / (cell_w * cell_h) as f32;
-                    chars.push(
-                        CHARS[((linear_to_srgb(brightness_avg)) * (CHARS.len() - 1) as f32).round()
-                            as usize],
-                    );
-                }
-            }
-            chars.push('\n');
-
-            chars
-        })
-        .collect::<String>();
+                chars
+            })
+            .collect::<String>()
+    };
 
     let chars_vec = chars.chars().filter(|&c| c != '\n').collect::<Vec<char>>();
-    let image = ImageBuffer::from_fn(img_width_snapped, img_height_snapped, |x, y| {
-        let cols = img_width_snapped / cell_w;
-        let char_index = (y / cell_h) * cols + x / cell_w;
-        let char = chars_vec[char_index as usize];
 
-        let char_index = CHARS
-            .iter()
-            .chain(EDGE_CHARS.iter())
-            .enumerate()
-            .find(|(_, c)| **c == char)
-            .map(|(i, _)| i)
-            .unwrap();
+    let mut buffer = Vec::with_capacity((img_width_snapped * img_height_snapped) as usize);
+    {
+        profiling::scope!("Rendering to Image");
 
-        let pixel = image.get_pixel(x, y);
-        let text_multiplier = (char_atlas[[
-            char_index as usize,
-            (y % cell_h * cell_w + x % cell_w) as usize,
-        ]] as f32
-            / 255.0)
-            .sqrt();
+        for y in 0..img_height_snapped {
+            for x in 0..img_width_snapped {
+                let cols = img_width_snapped / cell_w;
+                let char_index = (y / cell_h) * cols + x / cell_w;
+                let char = chars_vec[char_index as usize];
 
-        Rgb([
-            (pixel[0] as f32 / 255.0 * text_multiplier * 255.0).round() as u8,
-            (pixel[1] as f32 / 255.0 * text_multiplier * 255.0).round() as u8,
-            (pixel[2] as f32 / 255.0 * text_multiplier * 255.0).round() as u8,
-        ])
-    });
+                let char_index = {
+                    profiling::scope!("CHAR lookup");
+
+                    CHARS
+                        .iter()
+                        .chain(EDGE_CHARS.iter())
+                        .enumerate()
+                        .find(|(_, c)| **c == char)
+                        .map(|(i, _)| i)
+                        .unwrap()
+                };
+
+                let pixel = unsafe { image.unsafe_get_pixel(x, y) };
+                let text_multiplier = (char_atlas[[
+                    char_index as usize,
+                    (y % cell_h * cell_w + x % cell_w) as usize,
+                ]] as f32
+                    / 255.0)
+                    .sqrt();
+
+                buffer.push((pixel[0] as f32 / 255.0 * text_multiplier * 255.0).round() as u8);
+                buffer.push((pixel[1] as f32 / 255.0 * text_multiplier * 255.0).round() as u8);
+                buffer.push((pixel[2] as f32 / 255.0 * text_multiplier * 255.0).round() as u8);
+            }
+        }
+    }
+
+    let image = ImageBuffer::from_vec(img_width_snapped, img_height_snapped, buffer).unwrap();
 
     Ok((chars, DynamicImage::ImageRgb8(image)))
 }
