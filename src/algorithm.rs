@@ -1,6 +1,8 @@
 use crate::{join3, util::luma_f32_to_u8};
 use image::{DynamicImage, GenericImageView, GrayImage, ImageBuffer, Luma, Rgb};
 use linear_srgb::{default::linear_to_srgb, tf::srgb_to_linear};
+use rayon::iter::IntoParallelIterator;
+use rayon::iter::{IndexedParallelIterator, ParallelIterator};
 use std::{f32, ffi::OsString, ops::Sub, process};
 
 // dimmest to brightest
@@ -42,7 +44,7 @@ pub fn process_frame(
     cell_w: u32,
     cell_h: u32,
     debug_output: bool,
-) -> anyhow::Result<(Vec<char>, DynamicImage)> {
+) -> anyhow::Result<(String, DynamicImage)> {
     let image_luma8 = image.to_luma8();
     let image_luma_f32 = image.to_luma32f();
 
@@ -58,7 +60,7 @@ pub fn process_frame(
             ImageBuffer::from_fn(vertical_grad.width(), vertical_grad.height(), |x, y| {
                 let v = vertical_grad.get_pixel(x, y)[0] as f32;
                 let h = horizontal_grad.get_pixel(x, y)[0] as f32;
-                Luma([(v.powf(2.0) + h.powf(2.0)).sqrt().round() as u16])
+                Luma([(v * v + h * h).sqrt().round() as u16])
             })
         },
         || vertical_grad
@@ -120,65 +122,75 @@ pub fn process_frame(
     let img_width_snapped = (image_luma8.width() / cell_w as u32) * cell_w as u32;
     let img_height_snapped = (image_luma8.height() / cell_h as u32) * cell_h as u32;
 
-    let mut chars = String::with_capacity(
-        img_width_snapped as usize / cell_w as usize * img_height_snapped as usize
-            / cell_h as usize,
-    );
-    for y in (0..(img_height_snapped)).step_by(cell_h as usize) {
-        for x in (0..(img_width_snapped)).step_by(cell_w as usize) {
-            const EDGE_PIXELS_THRESHOLD: f32 = 0.1;
-            let mut edge_histogram = [0u32; 4];
-            let mut char_histogram = [0; CHARS.len()];
-            let mut edge_pixels = 0;
-            let mut brightness_sum = 0.0;
+    // let mut chars = String::with_capacity(
+    //     img_width_snapped as usize / cell_w as usize * img_height_snapped as usize
+    //         / cell_h as usize,
+    // );
 
-            for dy in 0..(cell_h as u32) {
-                for dx in 0..(cell_w as u32) {
-                    let pixel_index = ((y + dy) * image.width() + x + dx) as usize;
-                    let theta = angles[pixel_index];
+    let chars: String = (0..(img_height_snapped))
+        .into_par_iter()
+        .step_by(cell_h as usize)
+        .map(|y| {
+            let mut chars = String::with_capacity(cell_w as usize);
 
-                    brightness_sum += srgb_to_linear(image_luma_f32.get_pixel(x + dx, y + dy)[0]);
+            for x in (0..(img_width_snapped)).step_by(cell_w as usize) {
+                const EDGE_PIXELS_THRESHOLD: f32 = 0.1;
+                let mut edge_histogram = [0u32; 4];
+                // let mut char_histogram = [0; CHARS.len()];
+                let mut edge_pixels = 0;
+                let mut brightness_sum = 0.0;
 
-                    if dog.get_pixel(x + dx, y + dy)[0] > 0.02 {
-                        edge_histogram[angle_to_edge_index(theta)] += 1;
-                        edge_pixels += 1;
-                    }
+                for dy in 0..(cell_h as u32) {
+                    for dx in 0..(cell_w as u32) {
+                        let pixel_index = ((y + dy) * image.width() + x + dx) as usize;
+                        let theta = angles[pixel_index];
 
-                    for char_index in 0..CHARS.len() {
-                        let diff = (image_luma8.get_pixel(x + dx, y + dy)[0] as i16
-                            - (char_atlas[[char_index, (dy * cell_w as u32 + dx) as usize]]) as i16)
-                            .abs() as u32;
-                        char_histogram[char_index] += diff;
+                        brightness_sum +=
+                            srgb_to_linear(image_luma_f32.get_pixel(x + dx, y + dy)[0]);
+
+                        if unsafe { dog.unsafe_get_pixel(x + dx, y + dy)[0] } > 0.02 {
+                            edge_histogram[angle_to_edge_index(theta)] += 1;
+                            edge_pixels += 1;
+                        }
+
+                        // for char_index in 0..CHARS.len() {
+                        //     let diff = (image_luma8.get_pixel(x + dx, y + dy)[0] as i16
+                        //         - (char_atlas[[char_index, (dy * cell_w as u32 + dx) as usize]]) as i16)
+                        //         .abs() as u32;
+                        //     char_histogram[char_index] += diff;
+                        // }
                     }
                 }
-            }
 
-            let edge_pixels_ratio = edge_pixels as f32 / (cell_w * cell_h) as f32;
-            if edge_pixels_ratio > EDGE_PIXELS_THRESHOLD {
-                chars.push(
-                    EDGE_CHARS[edge_histogram
-                        .iter()
-                        .enumerate()
-                        .max_by_key(|(_, samples)| *samples)
-                        .map(|(i, _)| i)
-                        .unwrap()],
-                );
-            } else {
-                let brightness_avg = brightness_sum / (cell_w * cell_h) as f32;
-                chars.push(
-                    CHARS[((linear_to_srgb(brightness_avg)) * (CHARS.len() - 1) as f32).round()
-                        as usize],
-                );
+                let edge_pixels_ratio = edge_pixels as f32 / (cell_w * cell_h) as f32;
+                if edge_pixels_ratio > EDGE_PIXELS_THRESHOLD {
+                    chars.push(
+                        EDGE_CHARS[edge_histogram
+                            .iter()
+                            .enumerate()
+                            .max_by_key(|(_, samples)| *samples)
+                            .map(|(i, _)| i)
+                            .unwrap()],
+                    );
+                } else {
+                    let brightness_avg = brightness_sum / (cell_w * cell_h) as f32;
+                    chars.push(
+                        CHARS[((linear_to_srgb(brightness_avg)) * (CHARS.len() - 1) as f32).round()
+                            as usize],
+                    );
+                }
             }
-        }
-        chars.push('\n');
-    }
+            chars.push('\n');
 
-    let chars = chars.chars().filter(|&c| c != '\n').collect::<Vec<char>>();
+            chars
+        })
+        .collect::<String>();
+
+    let chars_vec = chars.chars().filter(|&c| c != '\n').collect::<Vec<char>>();
     let image = ImageBuffer::from_fn(img_width_snapped, img_height_snapped, |x, y| {
         let cols = img_width_snapped / cell_w;
         let char_index = (y / cell_h) * cols + x / cell_w;
-        let char = chars[char_index as usize];
+        let char = chars_vec[char_index as usize];
 
         let char_index = CHARS
             .iter()

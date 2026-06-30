@@ -1,21 +1,29 @@
 use clap::Parser;
-use image::{GenericImageView, GrayImage, ImageBuffer, Luma, Rgb};
+use image::{DynamicImage, GenericImageView, GrayImage, ImageBuffer, Luma, Rgb};
+use std::io::{self, Write};
+use std::str::FromStr;
 use std::{
     ops::Sub,
     path::{Path, PathBuf},
     process,
 };
-use video_rs::{Decoder, Encoder};
+use video_rs::frame::PixelFormat;
+use video_rs::{Decoder, DecoderBuilder, Encoder, EncoderBuilder};
 
+use crate::util::{image_to_frame, video_frame_to_image};
 use crate::{
     algorithm::{CHARS, EDGE_CHARS},
     font_renderer::render_fonts_to_atlas,
 };
+use mimalloc::MiMalloc;
 
 mod algorithm;
 mod font_renderer;
 #[macro_use]
 mod util;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 /// Convert images to ascii art with edge detection.
 #[derive(Parser, Debug)]
@@ -77,9 +85,48 @@ fn main() -> anyhow::Result<()> {
         let (chars, image) =
             algorithm::process_frame(&char_atlas, image, cell_w, cell_h, cfg!(debug_assertions))?;
 
-        print!("{}", String::from_iter(chars.iter()));
+        print!("{}", chars);
         image.save("./output/image.png")?;
     } else {
+        let mut decoder = Decoder::new(args.input)?;
+        let (src_w, src_h) = decoder.size();
+
+        let out_w = ((src_w / cell_w) * cell_w) & !1;
+        let out_h = ((src_h / cell_h) * cell_h) & !1;
+
+        let mut encoder = Encoder::new(
+            PathBuf::from_str("./output/render.mkv")?,
+            video_rs::encode::Settings::preset_h264_custom(
+                out_w as usize,
+                out_h as usize,
+                PixelFormat::YUV444P,
+                video_rs::Options::preset_h264_realtime(),
+            ),
+        )?;
+
+        let mut frames_processed = 0;
+        for frame in decoder.decode_iter() {
+            let (timestamp, frame) = match frame {
+                Ok(f) => f,
+                Err(_) => break,
+            };
+
+            let image = DynamicImage::ImageRgb8(video_frame_to_image(&frame));
+            let (_, render) = algorithm::process_frame(&char_atlas, image, cell_w, cell_h, false)?;
+            let render =
+                image::imageops::crop_imm(&render.to_rgb8(), 0, 0, out_w, out_h).to_image();
+
+            encoder.encode(&image_to_frame(&render), timestamp)?;
+            frames_processed += 1;
+
+            if frames_processed % 30 == 0 {
+                print!("Frames processed: {}\r", frames_processed);
+                io::stdout().flush()?;
+            }
+        }
+
+        encoder.finish()?;
+        println!("Done");
     }
 
     Ok(())

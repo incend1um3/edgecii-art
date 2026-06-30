@@ -1,3 +1,12 @@
 /target
+
+# Application outputs
 /.debug
 /output
+
+# Profiling stuff
+perf.data
+flamegraph.svg
+
+# Large test files
+/test-images/*.webm
