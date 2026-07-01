@@ -139,6 +139,7 @@ pub fn process_frame(
 
                 for x in (0..(img_width_snapped)).step_by(cell_w as usize) {
                     const EDGE_PIXELS_THRESHOLD: f32 = 0.15;
+                    const EDGE_DOMINANCE_THRESHOLD: f32 = 1.5;
                     let mut edge_histogram = [0u32; 4];
                     // let mut char_histogram = [0; CHARS.len()];
                     let mut edge_pixels = 0;
@@ -172,17 +173,26 @@ pub fn process_frame(
                         }
                     }
 
+                    let mut best_index = 0;
+                    let mut best_count = 0;
+                    let mut second_best_count = 0;
+                    for i in 0..EDGE_CHARS.len() {
+                        let count = edge_histogram[i];
+                        if count > best_count {
+                            second_best_count = best_count;
+
+                            best_index = i;
+                            best_count = count;
+                        } else if count > second_best_count {
+                            second_best_count = count;
+                        }
+                    }
+
                     let edge_pixels_ratio = edge_pixels as f32 / (cell_w * cell_h) as f32;
-                    if edge_pixels_ratio > EDGE_PIXELS_THRESHOLD {
-                        char_indices.push(
-                            CHARS.len()
-                                + edge_histogram
-                                    .iter()
-                                    .enumerate()
-                                    .max_by_key(|(_, samples)| *samples)
-                                    .map(|(i, _)| i)
-                                    .unwrap(),
-                        );
+                    let is_dominant =
+                        best_count as f32 >= second_best_count as f32 * EDGE_DOMINANCE_THRESHOLD;
+                    if edge_pixels_ratio > EDGE_PIXELS_THRESHOLD && is_dominant {
+                        char_indices.push(CHARS.len() + best_index);
                     } else {
                         let brightness_avg = brightness_sum / (cell_w * cell_h) as f32;
                         char_indices.push(
