@@ -1,4 +1,6 @@
 use clap::Parser;
+use gpu_video::VideoInstance;
+use gpu_video::parameters::VideoInstanceDescriptor;
 use image::{DynamicImage, GenericImageView, GrayImage, ImageBuffer, Luma, Rgb};
 use std::collections::HashMap;
 use std::io::{self, Write};
@@ -14,6 +16,7 @@ use std::{
 use video_rs::frame::PixelFormat;
 use video_rs::{Decoder, DecoderBuilder, Encoder, EncoderBuilder};
 
+use crate::gpu_encoder::GpuEncoder;
 use crate::util::{image_to_frame, video_frame_to_image};
 use crate::{
     algorithm::{CHARS, EDGE_CHARS},
@@ -23,6 +26,7 @@ use mimalloc::MiMalloc;
 
 mod algorithm;
 mod font_renderer;
+mod gpu_encoder;
 #[macro_use]
 mod util;
 
@@ -95,7 +99,7 @@ fn decode_thread(mut decoder: Decoder, mut tx: spmc::Sender<DecoderThreadOutput>
     tx.send(DecoderThreadOutput::End).unwrap();
 }
 
-fn encode_thread(mut encoder: Encoder, rx: mpsc::Receiver<ProcessedFrame>) {
+fn encode_thread(mut encoder: GpuEncoder, rx: mpsc::Receiver<ProcessedFrame>) {
     let mut queue = HashMap::<u32, ProcessedFrame>::new();
     let mut next = 0u32;
 
@@ -104,7 +108,7 @@ fn encode_thread(mut encoder: Encoder, rx: mpsc::Receiver<ProcessedFrame>) {
 
         while let Some(data) = queue.remove(&next) {
             profiling::scope!("Encode");
-            encoder.encode(&data.frame, data.timestamp).unwrap();
+            encoder.encode_frame(data.frame).unwrap();
             profiling::finish_frame!();
 
             FRAMES_IN_QUEUE.fetch_sub(1, Ordering::Relaxed);
@@ -117,7 +121,7 @@ fn encode_thread(mut encoder: Encoder, rx: mpsc::Receiver<ProcessedFrame>) {
         }
     }
 
-    encoder.finish().unwrap();
+    // encoder.finish().unwrap();
 }
 
 fn process_thread(
@@ -214,22 +218,33 @@ fn main() -> anyhow::Result<()> {
         let decoder = DecoderBuilder::new(args.input)
             .with_hardware_acceleration(video_rs::hwaccel::HardwareAccelerationDeviceType::VaApi)
             .build()?;
+
         let (src_w, src_h) = decoder.size();
+        let out_w = ((src_w / cell_w) * cell_w) & !1;
+        let out_h = ((src_h / cell_h) * cell_h) & !1;
+        eprintln!(
+            "out_w={} out_h={} cell_w={} cell_h={}",
+            out_w, out_h, cell_w, cell_h
+        );
+
+        let encoder = GpuEncoder::new(
+            out_w.try_into()?,
+            out_h.try_into()?,
+            decoder.frame_rate(),
+            Path::new("./output/render.h264"),
+        )?;
 
         let decoder_handle = std::thread::spawn(move || decode_thread(decoder, decode_tx));
 
-        let out_w = ((src_w / cell_w) * cell_w) & !1;
-        let out_h = ((src_h / cell_h) * cell_h) & !1;
-
-        let encoder = Encoder::new(
-            PathBuf::from_str("./output/render.mkv")?,
-            video_rs::encode::Settings::preset_h264_custom(
-                out_w as usize,
-                out_h as usize,
-                PixelFormat::YUV444P,
-                video_rs::Options::preset_h264_realtime(),
-            ),
-        )?;
+        // let encoder = Encoder::new(
+        //     PathBuf::from_str("./output/render.mkv")?,
+        //     video_rs::encode::Settings::preset_h264_custom(
+        //         out_w as usize,
+        //         out_h as usize,
+        //         PixelFormat::YUV444P,
+        //         video_rs::Options::preset_h264_realtime(),
+        //     ),
+        // )?;
 
         let encoder_handle = std::thread::spawn(move || encode_thread(encoder, encode_rx));
 
