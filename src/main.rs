@@ -1,6 +1,5 @@
 use clap::Parser;
-use gpu_video::VideoInstance;
-use gpu_video::parameters::VideoInstanceDescriptor;
+use ffmpeg_sidecar::download::FfmpegDownloadProgressEvent;
 use image::{DynamicImage, GenericImageView, GrayImage, ImageBuffer, Luma, Rgb};
 use std::collections::HashMap;
 use std::io::{self, Write};
@@ -16,6 +15,7 @@ use std::{
 use video_rs::frame::PixelFormat;
 use video_rs::{Decoder, DecoderBuilder, Encoder, EncoderBuilder};
 
+use crate::ffmpeg_encoder::FfmpegEncoder;
 use crate::gpu_encoder::GpuEncoder;
 use crate::util::{image_to_frame, video_frame_to_image};
 use crate::{
@@ -24,7 +24,11 @@ use crate::{
 };
 use mimalloc::MiMalloc;
 
+#[macro_use]
+extern crate strum_macros;
+
 mod algorithm;
+mod ffmpeg_encoder;
 mod font_renderer;
 mod gpu_encoder;
 #[macro_use]
@@ -99,7 +103,7 @@ fn decode_thread(mut decoder: Decoder, mut tx: spmc::Sender<DecoderThreadOutput>
     tx.send(DecoderThreadOutput::End).unwrap();
 }
 
-fn encode_thread(mut encoder: GpuEncoder, rx: mpsc::Receiver<ProcessedFrame>) {
+fn encode_thread(mut encoder: FfmpegEncoder, rx: mpsc::Receiver<ProcessedFrame>) {
     let mut queue = HashMap::<u32, ProcessedFrame>::new();
     let mut next = 0u32;
 
@@ -121,7 +125,7 @@ fn encode_thread(mut encoder: GpuEncoder, rx: mpsc::Receiver<ProcessedFrame>) {
         }
     }
 
-    // encoder.finish().unwrap();
+    encoder.finish().unwrap();
 }
 
 fn process_thread(
@@ -136,13 +140,17 @@ fn process_thread(
     loop {
         let (id, timestamp, frame) = {
             profiling::scope!("Wait for Decode");
-            match rx.recv().unwrap() {
-                DecoderThreadOutput::Data {
-                    id,
-                    timestamp,
-                    frame,
-                } => (id, timestamp, frame),
-                DecoderThreadOutput::End => break,
+            if let Ok(d) = rx.recv() {
+                match d {
+                    DecoderThreadOutput::Data {
+                        id,
+                        timestamp,
+                        frame,
+                    } => (id, timestamp, frame),
+                    DecoderThreadOutput::End => return,
+                }
+            } else {
+                break;
             }
         };
 
@@ -162,6 +170,28 @@ fn process_thread(
         })
         .unwrap();
     }
+}
+
+fn download_ffmpeg() {
+    ffmpeg_sidecar::download::auto_download_with_progress(|p| {
+        let message = match p {
+            FfmpegDownloadProgressEvent::Starting => "Starting FFMPEG download...".into(),
+            FfmpegDownloadProgressEvent::Downloading {
+                total_bytes,
+                downloaded_bytes,
+            } => format!(
+                "Downloading: {} kiB / {} kiB\t\t",
+                total_bytes as f32 / 1024.0,
+                downloaded_bytes as f32 / 1024.0
+            ),
+            FfmpegDownloadProgressEvent::UnpackingArchive => "Unpacking..".into(),
+            FfmpegDownloadProgressEvent::Done => "Done!\n".into(),
+        };
+
+        print!("Downloading FFMPEG binaries: {}\r", message);
+        let _ = std::io::stdout().flush();
+    })
+    .unwrap();
 }
 
 fn main() -> anyhow::Result<()> {
@@ -212,6 +242,8 @@ fn main() -> anyhow::Result<()> {
         print!("{}", chars);
         image.save("./output/image.png")?;
     } else {
+        download_ffmpeg();
+
         let (decode_tx, decode_rx) = spmc::channel();
         let (encode_tx, encode_rx) = mpsc::channel();
 
@@ -227,24 +259,24 @@ fn main() -> anyhow::Result<()> {
             out_w, out_h, cell_w, cell_h
         );
 
-        let encoder = GpuEncoder::new(
-            out_w.try_into()?,
-            out_h.try_into()?,
+        // let encoder = GpuEncoder::new(
+        //     out_w.try_into()?,
+        //     out_h.try_into()?,
+        //     decoder.frame_rate(),
+        //     Path::new("./output/render.h264"),
+        // )?;
+        let encoder = FfmpegEncoder::new(
+            out_w,
+            out_h,
             decoder.frame_rate(),
-            Path::new("./output/render.h264"),
+            PathBuf::from_str("./output/render.mkv")?,
+            ffmpeg_encoder::Codec::H265,
+            ffmpeg_encoder::Quality::Balanced,
+            ffmpeg_encoder::RateControl::Constant,
+            None,
         )?;
 
         let decoder_handle = std::thread::spawn(move || decode_thread(decoder, decode_tx));
-
-        // let encoder = Encoder::new(
-        //     PathBuf::from_str("./output/render.mkv")?,
-        //     video_rs::encode::Settings::preset_h264_custom(
-        //         out_w as usize,
-        //         out_h as usize,
-        //         PixelFormat::YUV444P,
-        //         video_rs::Options::preset_h264_realtime(),
-        //     ),
-        // )?;
 
         let encoder_handle = std::thread::spawn(move || encode_thread(encoder, encode_rx));
 

@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.102"
 clap = { version = "4.6.1", features = ["derive"] }
+ffmpeg-sidecar = "2.5.2"
 freetype-rs = { version = "0.38.0", features = ["bundled"] }
 gpu-video = { path = "/drives/compressed/Programming/gitplayground/smelter/gpu-video" }
 image = "0.25.10"
@@ -21,6 +22,8 @@ rayon = "1.12.0"
 rgb2yuv420 = "0.2.3"
 spmc = "0.3.0"
 video-rs = { version = "0.11.0", features = ["ndarray"] }
+strum = "0.28"
+strum_macros = "0.28"
 
 [profile.dev]
 opt-level = 1

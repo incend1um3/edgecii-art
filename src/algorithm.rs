@@ -139,7 +139,7 @@ pub fn process_frame(
 
                 for x in (0..(img_width_snapped)).step_by(cell_w as usize) {
                     const EDGE_PIXELS_THRESHOLD: f32 = 0.15;
-                    const EDGE_DOMINANCE_THRESHOLD: f32 = 1.5;
+                    const EDGE_DOMINANCE_THRESHOLD: f32 = 1.2;
                     let mut edge_histogram = [0u32; 4];
                     // let mut char_histogram = [0; CHARS.len()];
                     let mut edge_pixels = 0;
@@ -174,7 +174,7 @@ pub fn process_frame(
                     }
 
                     let mut best_index = 0;
-                    let mut best_count = 0;
+                    let mut best_count = edge_histogram[0];
                     let mut second_best_count = 0;
                     for i in 0..EDGE_CHARS.len() {
                         let count = edge_histogram[i];
