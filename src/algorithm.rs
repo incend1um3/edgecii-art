@@ -1,4 +1,8 @@
-use crate::{join3, util::luma_f32_to_u8};
+use crate::{
+    join3,
+    structure_tensor::{CellStructureTensors, StructureTensor},
+    util::luma_f32_to_u8,
+};
 use image::{DynamicImage, GenericImageView, GrayImage, ImageBuffer, Luma, Rgb};
 use linear_srgb::{default::linear_to_srgb, tf::srgb_to_linear};
 use std::{f32, ffi::OsString, ops::Sub, process};
@@ -6,7 +10,7 @@ use std::{f32, ffi::OsString, ops::Sub, process};
 // dimmest to brightest
 pub const CHARS: [char; 9] = [' ', '.', ':', '=', '+', '*', '#', '%', '@'];
 // no order
-pub const EDGE_CHARS: [char; 4] = ['|', '/', '_', '\\'];
+pub const EDGE_CHARS: [char; 10] = ['|', '/', '-', '\\', '^', 'V', '<', '>', 'T', 'L'];
 
 #[inline(always)]
 pub fn angle_to_edge_index(theta: f32) -> usize {
@@ -14,6 +18,11 @@ pub fn angle_to_edge_index(theta: f32) -> usize {
 
     let t = (theta.rem_euclid(PI) + PI / 8.0) % PI; // shift by half a bin
     (t / PI * 4.0) as usize % 4
+}
+
+#[inline(always)]
+pub fn angle_to_edge_char(theta: f32) -> char {
+    EDGE_CHARS[angle_to_edge_index(theta)]
 }
 
 #[profiling::function]
@@ -102,9 +111,7 @@ pub fn process_frame(
             let mut brightness_sum = 0.0;
 
             // structure tensor
-            let mut gx_squared = 0.0;
-            let mut gxgy = 0.0;
-            let mut gy_squared = 0.0;
+            let mut tensors = CellStructureTensors::new(cell_w, cell_h);
 
             for dy in 0..(cell_h as u32) {
                 for dx in 0..(cell_w as u32) {
@@ -120,9 +127,7 @@ pub fn process_frame(
                         )
                     };
 
-                    gx_squared += gx * gx;
-                    gxgy += gx * gy;
-                    gy_squared += gy * gy;
+                    tensors.accumulate(dx, dy, gx, gy);
 
                     // for char_index in 0..CHARS.len() {
                     //     let diff = (image_luma8.get_pixel(x + dx, y + dy)[0] as i16
@@ -133,17 +138,50 @@ pub fn process_frame(
                 }
             }
 
-            let trace = gx_squared + gy_squared;
-            let coherence = ((gx_squared - gy_squared).powi(2) + 4.0 * gxgy * gxgy).sqrt() / trace;
-
             const SOBEL_MAX_RECIPROCAL_SQ: f32 = 1.0 / (1020.0 * 1020.0);
-            let energy = trace / (cell_h * cell_w) as f32 * SOBEL_MAX_RECIPROCAL_SQ;
-            if energy > EDGE_ENERGY_THRESHOLD && coherence > EDGE_COHERANCE_THRESHOLD {
-                // eigendecomposition
-                // tan 2θ = 2b / (a - c)
-                let theta = 0.5 * libm::atan2f(2.0 * gxgy, gx_squared - gy_squared);
 
-                char_indices.push(CHARS.len() + angle_to_edge_index(theta));
+            let test = |t: &StructureTensor| -> Option<char> {
+                if t.energy_avg() * SOBEL_MAX_RECIPROCAL_SQ > EDGE_ENERGY_THRESHOLD
+                    && t.coherence() > EDGE_COHERANCE_THRESHOLD * 0.8
+                {
+                    Some(angle_to_edge_char(t.theta()))
+                } else {
+                    None
+                }
+            };
+
+            let top = test(&tensors.top);
+            let bottom = test(&tensors.bottom);
+            let left = test(&tensors.left);
+            let right = test(&tensors.right);
+
+            let special_edge_index = match (top, bottom, left, right) {
+                (Some(t), Some(b), None, None) => match (t, b) {
+                    ('-', '|') => Some(8),
+                    ('\\', '/') => Some(7),
+                    ('/', '\\') => Some(6),
+                    (_, _) => None,
+                },
+                (None, None, Some(l), Some(r)) => match (l, r) {
+                    ('\\', '/') => Some(5),
+                    ('/', '\\') => Some(4),
+                    (_, _) => None,
+                },
+                (Some(t), Some(b), Some(l), Some(r)) => match (t, b, l, r) {
+                    ('|', '-', '|', '-') => Some(9),
+                    (_, _, _, _) => None,
+                },
+                (_, _, _, _) => None,
+            };
+
+            let energy = tensors.combined.energy_avg() * SOBEL_MAX_RECIPROCAL_SQ;
+
+            if let Some(i) = special_edge_index {
+                char_indices.push(CHARS.len() + i);
+            } else if energy > EDGE_ENERGY_THRESHOLD
+                && tensors.combined.coherence() > EDGE_COHERANCE_THRESHOLD
+            {
+                char_indices.push(CHARS.len() + angle_to_edge_index(tensors.combined.theta()));
             } else {
                 let brightness_avg = brightness_sum / (cell_w * cell_h) as f32;
                 char_indices.push(

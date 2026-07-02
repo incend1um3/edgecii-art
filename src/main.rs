@@ -12,7 +12,6 @@ use std::{
     path::{Path, PathBuf},
     process,
 };
-use video_rs::frame::PixelFormat;
 use video_rs::{Decoder, DecoderBuilder, Encoder, EncoderBuilder};
 
 use crate::ffmpeg_encoder::FfmpegEncoder;
@@ -29,6 +28,7 @@ extern crate strum_macros;
 mod algorithm;
 mod ffmpeg_encoder;
 mod font_renderer;
+mod structure_tensor;
 #[macro_use]
 mod util;
 
