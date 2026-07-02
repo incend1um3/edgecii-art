@@ -16,7 +16,6 @@ use video_rs::frame::PixelFormat;
 use video_rs::{Decoder, DecoderBuilder, Encoder, EncoderBuilder};
 
 use crate::ffmpeg_encoder::FfmpegEncoder;
-use crate::gpu_encoder::GpuEncoder;
 use crate::util::{image_to_frame, video_frame_to_image};
 use crate::{
     algorithm::{CHARS, EDGE_CHARS},
@@ -30,7 +29,6 @@ extern crate strum_macros;
 mod algorithm;
 mod ffmpeg_encoder;
 mod font_renderer;
-mod gpu_encoder;
 #[macro_use]
 mod util;
 
@@ -240,7 +238,7 @@ fn main() -> anyhow::Result<()> {
         );
 
         print!("{}", chars);
-        image.save("./output/image.png")?;
+        image.save("./output/render.png")?;
     } else {
         download_ffmpeg();
 

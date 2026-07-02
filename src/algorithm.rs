@@ -8,37 +8,12 @@ pub const CHARS: [char; 9] = [' ', '.', ':', '=', '+', '*', '#', '%', '@'];
 // no order
 pub const EDGE_CHARS: [char; 4] = ['|', '/', '_', '\\'];
 
+#[inline(always)]
 pub fn angle_to_edge_index(theta: f32) -> usize {
     use f32::consts::PI;
 
     let t = (theta.rem_euclid(PI) + PI / 8.0) % PI; // shift by half a bin
     (t / PI * 4.0) as usize % 4
-}
-
-#[profiling::function]
-pub fn difference_of_gaussians(
-    img: &ImageBuffer<Luma<f32>, Vec<f32>>,
-    sigma1: f32,
-    sigma2: f32,
-) -> ImageBuffer<Luma<f32>, Vec<f32>> {
-    assert!(sigma1 < sigma2);
-
-    let (blur1, blur2) = {
-        profiling::scope!("fast_blur");
-        (
-            image::imageops::fast_blur(img, sigma1),
-            image::imageops::fast_blur(img, sigma2),
-        )
-    };
-
-    profiling::scope!("subtract");
-    let raw = blur1
-        .iter()
-        .zip(blur2.iter())
-        .map(|(a, b)| (a - b).abs())
-        .collect::<Vec<_>>();
-
-    ImageBuffer::from_raw(img.width(), img.height(), raw).unwrap()
 }
 
 #[profiling::function]
@@ -52,10 +27,6 @@ pub fn process_frame(
     let image_luma8 = image.to_luma8();
     let image_luma_f32 = image.to_luma32f();
 
-    let dog = {
-        profiling::scope!("DoG");
-        difference_of_gaussians(&image_luma_f32, 1.4, 1.6 * 1.4)
-    };
     let vertical_grad = {
         profiling::scope!("Vertical Sobel");
         imageproc::gradients::vertical_sobel(&image_luma8)
@@ -63,11 +34,6 @@ pub fn process_frame(
     let horizontal_grad = {
         profiling::scope!("Horizontal Sobel");
         imageproc::gradients::horizontal_sobel(&image_luma8)
-    };
-
-    let dog_luma8 = {
-        profiling::scope!("DoG Cast");
-        luma_f32_to_u8(&dog)
     };
 
     if debug_output {
@@ -86,10 +52,7 @@ pub fn process_frame(
         )
         .expect("Vector size matches width * height");
 
-        rayon::join(
-            || angles_img.save("./.debug/angles.png").unwrap(),
-            || dog_luma8.save("./.debug/dog.png").unwrap(),
-        );
+        angles_img.save("./.debug/angles.png").unwrap();
 
         let magnitudes =
             ImageBuffer::from_fn(vertical_grad.width(), vertical_grad.height(), |x, y| {
@@ -129,84 +92,66 @@ pub fn process_frame(
     let img_width_snapped = (image_luma8.width() / cell_w as u32) * cell_w as u32;
     let img_height_snapped = (image_luma8.height() / cell_h as u32) * cell_h as u32;
 
-    let char_indices = {
-        profiling::scope!("Conversion Loop");
-        (0..(img_height_snapped))
-            .into_iter()
-            .step_by(cell_h as usize)
-            .map(|y| {
-                let mut char_indices = Vec::with_capacity(cell_w as usize);
+    let mut char_indices =
+        Vec::with_capacity((img_width_snapped * img_height_snapped / (cell_w * cell_h)) as usize);
+    for y in (0..(img_height_snapped)).step_by(cell_h as usize) {
+        for x in (0..(img_width_snapped)).step_by(cell_w as usize) {
+            const EDGE_COHERANCE_THRESHOLD: f32 = 0.6;
+            const EDGE_ENERGY_THRESHOLD: f32 = 0.0025;
 
-                for x in (0..(img_width_snapped)).step_by(cell_w as usize) {
-                    const EDGE_PIXELS_THRESHOLD: f32 = 0.15;
-                    const EDGE_DOMINANCE_THRESHOLD: f32 = 1.2;
-                    let mut edge_histogram = [0u32; 4];
-                    // let mut char_histogram = [0; CHARS.len()];
-                    let mut edge_pixels = 0;
-                    let mut brightness_sum = 0.0;
+            let mut brightness_sum = 0.0;
 
-                    for dy in 0..(cell_h as u32) {
-                        for dx in 0..(cell_w as u32) {
-                            // let pixel_index = ((y + dy) * image.width() + x + dx) as usize;
-                            brightness_sum += unsafe {
-                                srgb_to_linear(image_luma_f32.unsafe_get_pixel(x + dx, y + dy)[0])
-                            };
+            // structure tensor
+            let mut gx_squared = 0.0;
+            let mut gxgy = 0.0;
+            let mut gy_squared = 0.0;
 
-                            if unsafe { dog.unsafe_get_pixel(x + dx, y + dy)[0] } > 0.025 {
-                                let theta = unsafe {
-                                    libm::atan2f(
-                                        vertical_grad.unsafe_get_pixel(x + dx, y + dy)[0] as f32,
-                                        horizontal_grad.unsafe_get_pixel(x + dx, y + dy)[0] as f32,
-                                    )
-                                };
+            for dy in 0..(cell_h as u32) {
+                for dx in 0..(cell_w as u32) {
+                    // let pixel_index = ((y + dy) * image.width() + x + dx) as usize;
+                    brightness_sum += unsafe {
+                        srgb_to_linear(image_luma_f32.unsafe_get_pixel(x + dx, y + dy)[0])
+                    };
 
-                                edge_histogram[angle_to_edge_index(theta)] += 1;
-                                edge_pixels += 1;
-                            }
+                    let (gx, gy) = unsafe {
+                        (
+                            horizontal_grad.unsafe_get_pixel(x + dx, y + dy)[0] as f32,
+                            vertical_grad.unsafe_get_pixel(x + dx, y + dy)[0] as f32,
+                        )
+                    };
 
-                            // for char_index in 0..CHARS.len() {
-                            //     let diff = (image_luma8.get_pixel(x + dx, y + dy)[0] as i16
-                            //         - (char_atlas[[char_index, (dy * cell_w as u32 + dx) as usize]]) as i16)
-                            //         .abs() as u32;
-                            //     char_histogram[char_index] += diff;
-                            // }
-                        }
-                    }
+                    gx_squared += gx * gx;
+                    gxgy += gx * gy;
+                    gy_squared += gy * gy;
 
-                    let mut best_index = 0;
-                    let mut best_count = edge_histogram[0];
-                    let mut second_best_count = 0;
-                    for i in 0..EDGE_CHARS.len() {
-                        let count = edge_histogram[i];
-                        if count > best_count {
-                            second_best_count = best_count;
-
-                            best_index = i;
-                            best_count = count;
-                        } else if count > second_best_count {
-                            second_best_count = count;
-                        }
-                    }
-
-                    let edge_pixels_ratio = edge_pixels as f32 / (cell_w * cell_h) as f32;
-                    let is_dominant =
-                        best_count as f32 >= second_best_count as f32 * EDGE_DOMINANCE_THRESHOLD;
-                    if edge_pixels_ratio > EDGE_PIXELS_THRESHOLD && is_dominant {
-                        char_indices.push(CHARS.len() + best_index);
-                    } else {
-                        let brightness_avg = brightness_sum / (cell_w * cell_h) as f32;
-                        char_indices.push(
-                            ((linear_to_srgb(brightness_avg)) * (CHARS.len() - 1) as f32).round()
-                                as usize,
-                        );
-                    }
+                    // for char_index in 0..CHARS.len() {
+                    //     let diff = (image_luma8.get_pixel(x + dx, y + dy)[0] as i16
+                    //         - (char_atlas[[char_index, (dy * cell_w as u32 + dx) as usize]]) as i16)
+                    //         .abs() as u32;
+                    //     char_histogram[char_index] += diff;
+                    // }
                 }
+            }
 
-                char_indices
-            })
-            .flatten()
-            .collect::<Vec<usize>>()
-    };
+            let trace = gx_squared + gy_squared;
+            let coherence = ((gx_squared - gy_squared).powi(2) + 4.0 * gxgy * gxgy).sqrt() / trace;
+
+            const SOBEL_MAX_RECIPROCAL_SQ: f32 = 1.0 / (1020.0 * 1020.0);
+            let energy = trace / (cell_h * cell_w) as f32 * SOBEL_MAX_RECIPROCAL_SQ;
+            if energy > EDGE_ENERGY_THRESHOLD && coherence > EDGE_COHERANCE_THRESHOLD {
+                // eigendecomposition
+                // tan 2θ = 2b / (a - c)
+                let theta = 0.5 * libm::atan2f(2.0 * gxgy, gx_squared - gy_squared);
+
+                char_indices.push(CHARS.len() + angle_to_edge_index(theta));
+            } else {
+                let brightness_avg = brightness_sum / (cell_w * cell_h) as f32;
+                char_indices.push(
+                    ((linear_to_srgb(brightness_avg)) * (CHARS.len() - 1) as f32).round() as usize,
+                );
+            }
+        }
+    }
 
     let mut buffer = Vec::with_capacity((img_width_snapped * img_height_snapped) as usize);
     {
@@ -248,7 +193,7 @@ pub fn char_indices_to_string(
 
     for y in 0..(img_height / cell_h) {
         for x in 0..(img_width / cell_w) {
-            let index = indices[(y * cell_h + x) as usize];
+            let index = indices[(y * (img_width / cell_w) + x) as usize];
 
             let char = CHARS
                 .iter()
