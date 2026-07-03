@@ -1,10 +1,10 @@
 use clap::Parser;
 use ffmpeg_sidecar::download::FfmpegDownloadProgressEvent;
-use image::{DynamicImage, GenericImageView, GrayImage, ImageBuffer, Luma, Rgb};
+use image::{DynamicImage, GrayImage};
 use std::collections::HashMap;
-use std::io::{self, Write};
+use std::io::Write;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 use std::{
@@ -12,7 +12,7 @@ use std::{
     path::{Path, PathBuf},
     process,
 };
-use video_rs::{Decoder, DecoderBuilder, Encoder, EncoderBuilder};
+use video_rs::{Decoder, DecoderBuilder};
 
 use crate::ffmpeg_encoder::FfmpegEncoder;
 use crate::util::{image_to_frame, video_frame_to_image};
@@ -46,6 +46,22 @@ struct Args {
     /// Height of characters passed to FreeType (this may be different from the actual height of rendered cells)
     #[arg(short, long)]
     char_height: u8,
+
+    /// Hardware accelerator to use for the encoder. Automatically defaults to a suitable one supported by the system.
+    #[arg(long)]
+    hw_accel: Option<ffmpeg_encoder::Vendor>,
+
+    /// Compression level passed to the encoder.
+    #[arg(long, default_value_t = ffmpeg_encoder::CompressionLevel::Balanced)]
+    compression_level: ffmpeg_encoder::CompressionLevel,
+
+    /// Average bit rate in kbps when using variable bit rate.
+    #[arg(short, long, default_value_t = 12_000)]
+    bit_rate: u16,
+
+    // Write debug output images (sobel gradients, angles, etc.) when processing an image. This does not apply to videos.
+    #[arg(short, long)]
+    debug_output: bool,
 }
 
 fn _compare_slices<T>(a: &[T], b: &[T]) -> T
@@ -192,6 +208,48 @@ fn download_ffmpeg() {
     .unwrap();
 }
 
+fn create_decoder(file: &Path) -> anyhow::Result<video_rs::Decoder> {
+    if !file.exists() || !file.is_file() {
+        anyhow::bail!("Input file not found: {}", file.display());
+    }
+
+    let accelerators_available =
+        video_rs::hwaccel::HardwareAccelerationDeviceType::list_available();
+    println!("Available decoders: {:#?}", accelerators_available);
+    if accelerators_available.is_empty() {
+        return Ok(Decoder::new(file)?);
+    }
+
+    use video_rs::hwaccel::HardwareAccelerationDeviceType::*;
+    let accel_order = [Cuda, D3D11Va, Dxva2, Vdpau, VaApi, Qsv, VideoToolbox];
+    let accelerators_available = accel_order
+        .iter()
+        .filter(|a| accelerators_available.contains(a));
+
+    video_rs::ffmpeg::log::set_level(video_rs::ffmpeg::log::Level::Quiet);
+    for accel in accelerators_available {
+        let decoder = DecoderBuilder::new(file)
+            .with_hardware_acceleration(*accel)
+            .build();
+
+        if let Ok(mut d) = decoder
+            && d.decode_raw().is_ok()
+        {
+            d.seek_to_start()?;
+            video_rs::ffmpeg::log::set_level(video_rs::ffmpeg::log::Level::Warning);
+
+            println!("Using hardware accelerated decoding: {:#?}", accel);
+            return Ok(d);
+        }
+    }
+
+    println!(
+        "Warning: using software decoding because no working hardware decoder implementation was found. This will be EXTREMELY slow!"
+    );
+    video_rs::ffmpeg::log::set_level(video_rs::ffmpeg::log::Level::Warning);
+    Ok(Decoder::new(file)?)
+}
+
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
@@ -246,9 +304,7 @@ fn main() -> anyhow::Result<()> {
         let (decode_tx, decode_rx) = spmc::channel();
         let (encode_tx, encode_rx) = mpsc::channel();
 
-        let decoder = DecoderBuilder::new(args.input)
-            .with_hardware_acceleration(video_rs::hwaccel::HardwareAccelerationDeviceType::VaApi)
-            .build()?;
+        let decoder = create_decoder(&args.input)?;
 
         let (src_w, src_h) = decoder.size();
         let out_w = ((src_w / cell_w) * cell_w) & !1;
@@ -270,7 +326,7 @@ fn main() -> anyhow::Result<()> {
             decoder.frame_rate(),
             PathBuf::from_str("./output/render.mkv")?,
             ffmpeg_encoder::Codec::H265,
-            ffmpeg_encoder::Quality::Balanced,
+            ffmpeg_encoder::CompressionLevel::Balanced,
             ffmpeg_encoder::RateControl::Constant,
             None,
         )?;

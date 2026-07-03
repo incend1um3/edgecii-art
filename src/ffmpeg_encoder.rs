@@ -7,7 +7,7 @@ use std::{
 
 use ffmpeg_sidecar::paths::ffmpeg_path;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, IntoStaticStr)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, IntoStaticStr, clap::ValueEnum)]
 pub enum Vendor {
     Nvenc,
     Amf,
@@ -34,19 +34,22 @@ pub enum RateControl {
     },
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Quality {
-    Performance,
+#[derive(Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum, strum_macros::Display)]
+pub enum CompressionLevel {
+    #[strum(serialize = "fast")]
+    Fast,
+    #[strum(serialize = "balanced")]
     Balanced,
-    HighQuality,
+    #[strum(serialize = "high")]
+    High,
 }
 
-impl Quality {
+impl CompressionLevel {
     fn idx(self) -> usize {
         match self {
-            Self::Performance => 0,
+            Self::Fast => 0,
             Self::Balanced => 1,
-            Self::HighQuality => 2,
+            Self::High => 2,
         }
     }
 }
@@ -68,7 +71,7 @@ impl FfmpegEncoder {
         fps: f32,
         output: PathBuf,
         codec: Codec,
-        quality: Quality,
+        quality: CompressionLevel,
         rate: RateControl,
         preferred_vendor: Option<Vendor>,
     ) -> anyhow::Result<Self> {
@@ -223,13 +226,13 @@ fn vendor_order() -> &'static [Vendor] {
 /// on unusual setups you may need to adjust `/dev/dri/renderD128`.
 fn hw_setup_args(vendor: Vendor) -> (Vec<String>, Vec<String>) {
     match vendor {
-        // These uploaders take software NV12 frames and upload internally.
+        // These uploaders take software P010 (10-bit) frames and upload internally.
         Vendor::Nvenc | Vendor::Amf | Vendor::VideoToolbox => {
-            (vec![], vec!["-pix_fmt".into(), "nv12".into()])
+            (vec![], vec!["-pix_fmt".into(), "p010le".into()])
         }
         Vendor::Vaapi => (
             vec!["-vaapi_device".into(), "/dev/dri/renderD128".into()],
-            vec!["-vf".into(), "format=nv12,hwupload".into()],
+            vec!["-vf".into(), "format=p010le,hwupload".into()],
         ),
         Vendor::Qsv => (
             vec![
@@ -240,10 +243,10 @@ fn hw_setup_args(vendor: Vendor) -> (Vec<String>, Vec<String>) {
             ],
             vec![
                 "-vf".into(),
-                "format=nv12,hwupload=extra_hw_frames=64".into(),
+                "format=p010le,hwupload=extra_hw_frames=64".into(),
             ],
         ),
-        Vendor::Software => (vec![], vec!["-pix_fmt".into(), "yuv420p".into()]),
+        Vendor::Software => (vec![], vec!["-pix_fmt".into(), "yuv420p10le".into()]),
     }
 }
 
@@ -289,12 +292,12 @@ fn run_with_timeout(mut cmd: Command, timeout: Duration) -> bool {
 fn create_rate_and_preset_args(
     codec: Codec,
     vendor: Vendor,
-    quality: Quality,
+    compression_level: CompressionLevel,
     rate: &RateControl,
 ) -> Vec<String> {
     let mut a: Vec<String> = Vec::new();
     let mut push = |args: &[&str]| a.extend(args.iter().map(|s| s.to_string()));
-    let q = quality.idx();
+    let q = compression_level.idx();
 
     match vendor {
         Vendor::Nvenc => {
@@ -378,7 +381,7 @@ fn create_rate_and_preset_args(
             }
         }
         Vendor::VideoToolbox => {
-            if quality == Quality::Performance {
+            if compression_level == CompressionLevel::Fast {
                 push(&["-realtime", "1"]);
             }
             match rate {
