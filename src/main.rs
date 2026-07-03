@@ -238,6 +238,7 @@ fn main() -> anyhow::Result<()> {
         );
 
         print!("{}", chars);
+        std::fs::write("./output/render.txt", chars)?;
         image.save("./output/render.png")?;
     } else {
         download_ffmpeg();
@@ -292,6 +293,8 @@ fn main() -> anyhow::Result<()> {
 
         decoder_handle.join().unwrap();
         worker_handles.into_iter().for_each(|h| h.join().unwrap());
+
+        drop(encode_tx);
         encoder_handle.join().unwrap();
 
         println!("Done");

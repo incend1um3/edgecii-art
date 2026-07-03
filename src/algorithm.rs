@@ -1,19 +1,15 @@
-use crate::{
-    join3,
-    structure_tensor::{CellStructureTensors, StructureTensor},
-    util::luma_f32_to_u8,
-};
+use crate::structure_tensor::{CellStructureTensors, StructureTensor};
 use image::{DynamicImage, GenericImageView, GrayImage, ImageBuffer, Luma, Rgb};
 use linear_srgb::{default::linear_to_srgb, tf::srgb_to_linear};
-use std::{f32, ffi::OsString, ops::Sub, process};
+use std::f32;
 
 // dimmest to brightest
-pub const CHARS: [char; 9] = [' ', '.', ':', '=', '+', '*', '#', '%', '@'];
+pub const CHARS: [char; 10] = [' ', '.', ':', '*', 'o', '?', '#', '%', '@', '■'];
 // no order
-pub const EDGE_CHARS: [char; 10] = ['|', '/', '-', '\\', '^', 'V', '<', '>', 'T', 'L'];
+pub const EDGE_CHARS: [char; 11] = ['|', '/', '-', '\\', '^', 'V', '<', '>', 'T', 'L', 'X'];
 
 #[inline(always)]
-pub fn angle_to_edge_index(theta: f32) -> usize {
+fn angle_to_edge_index(theta: f32) -> usize {
     use f32::consts::PI;
 
     let t = (theta.rem_euclid(PI) + PI / 8.0) % PI; // shift by half a bin
@@ -21,8 +17,88 @@ pub fn angle_to_edge_index(theta: f32) -> usize {
 }
 
 #[inline(always)]
-pub fn angle_to_edge_char(theta: f32) -> char {
-    EDGE_CHARS[angle_to_edge_index(theta)]
+fn angle_dist(a: f32, b: f32) -> f32 {
+    let d = (a - b).rem_euclid(f32::consts::PI);
+    d.min(f32::consts::PI - d)
+}
+
+const EDGE_COHERANCE_THRESHOLD: f32 = 0.6;
+const EDGE_ENERGY_THRESHOLD: f32 = 0.0025;
+const SOBEL_MAX_RECIPROCAL_SQ: f32 = 1.0 / (1020.0 * 1020.0);
+
+#[profiling::function]
+fn try_special(tensors: &CellStructureTensors) -> Option<usize> {
+    const ANGLE_TOLERANCE: f32 = f32::to_radians(30.0);
+    const ALIGNMENT_TOLERANCE: f32 = 0.3;
+
+    const THETA_FSLASH: f32 = f32::to_radians(45.0);
+    const THETA_HORIZONTAL: f32 = 90.0f32.to_radians();
+    const THETA_VERTICAL: f32 = 0.0;
+    const THETA_BSLASH: f32 = f32::to_radians(45.0 + 90.0);
+
+    let combined = tensors.combined();
+    if combined.coherence() > EDGE_COHERANCE_THRESHOLD {
+        return None;
+    }
+
+    let left = tensors.left();
+    let right = tensors.right();
+    let top = tensors.top();
+    let bottom = tensors.bottom();
+
+    let tl = &tensors.tl;
+    let tr = &tensors.tr;
+    let bl = &tensors.bl;
+    let br = &tensors.br;
+
+    let is_stroke = |tensor: &StructureTensor, angle: f32| {
+        angle_dist(tensor.theta(), angle) < ANGLE_TOLERANCE
+            && tensor.energy_avg() * SOBEL_MAX_RECIPROCAL_SQ > EDGE_ENERGY_THRESHOLD
+            && tensor.coherence() > EDGE_COHERANCE_THRESHOLD * 0.8
+    };
+
+    let is_stroke_junction = |tensor: &StructureTensor, angle: f32| {
+        tensor.energy_avg() * SOBEL_MAX_RECIPROCAL_SQ > EDGE_ENERGY_THRESHOLD
+            && tensor.directional_alignment(angle) > ALIGNMENT_TOLERANCE
+    };
+
+    // V
+    if is_stroke(&left, THETA_BSLASH) && is_stroke(&right, THETA_FSLASH) {
+        return Some(5);
+    }
+    // ^
+    if is_stroke(&left, THETA_FSLASH) && is_stroke(&right, THETA_BSLASH) {
+        return Some(4);
+    }
+    // >
+    if is_stroke(&top, THETA_BSLASH) && is_stroke(&bottom, THETA_FSLASH) {
+        return Some(7);
+    }
+    // <
+    if is_stroke(&top, THETA_FSLASH) && is_stroke(&bottom, THETA_BSLASH) {
+        return Some(6);
+    }
+    // T
+    if is_stroke_junction(&top, THETA_HORIZONTAL) && is_stroke(&bottom, THETA_VERTICAL) {
+        return Some(8);
+    }
+    // L
+    if is_stroke_junction(&left, THETA_VERTICAL)
+        && is_stroke(&br, THETA_HORIZONTAL)
+        && tr.energy_avg() * SOBEL_MAX_RECIPROCAL_SQ < EDGE_ENERGY_THRESHOLD
+    {
+        return Some(9);
+    }
+    // x
+    if is_stroke(&tl, THETA_BSLASH)
+        && is_stroke(&tr, THETA_FSLASH)
+        && is_stroke(&bl, THETA_FSLASH)
+        && is_stroke(&br, THETA_BSLASH)
+    {
+        return Some(10);
+    }
+
+    None
 }
 
 #[profiling::function]
@@ -105,9 +181,6 @@ pub fn process_frame(
         Vec::with_capacity((img_width_snapped * img_height_snapped / (cell_w * cell_h)) as usize);
     for y in (0..(img_height_snapped)).step_by(cell_h as usize) {
         for x in (0..(img_width_snapped)).step_by(cell_w as usize) {
-            const EDGE_COHERANCE_THRESHOLD: f32 = 0.6;
-            const EDGE_ENERGY_THRESHOLD: f32 = 0.0025;
-
             let mut brightness_sum = 0.0;
 
             // structure tensor
@@ -138,50 +211,17 @@ pub fn process_frame(
                 }
             }
 
-            const SOBEL_MAX_RECIPROCAL_SQ: f32 = 1.0 / (1020.0 * 1020.0);
+            let special_edge_index = try_special(&tensors);
 
-            let test = |t: &StructureTensor| -> Option<char> {
-                if t.energy_avg() * SOBEL_MAX_RECIPROCAL_SQ > EDGE_ENERGY_THRESHOLD
-                    && t.coherence() > EDGE_COHERANCE_THRESHOLD * 0.8
-                {
-                    Some(angle_to_edge_char(t.theta()))
-                } else {
-                    None
-                }
-            };
-
-            let top = test(&tensors.top);
-            let bottom = test(&tensors.bottom);
-            let left = test(&tensors.left);
-            let right = test(&tensors.right);
-
-            let special_edge_index = match (top, bottom, left, right) {
-                (Some(t), Some(b), None, None) => match (t, b) {
-                    ('-', '|') => Some(8),
-                    ('\\', '/') => Some(7),
-                    ('/', '\\') => Some(6),
-                    (_, _) => None,
-                },
-                (None, None, Some(l), Some(r)) => match (l, r) {
-                    ('\\', '/') => Some(5),
-                    ('/', '\\') => Some(4),
-                    (_, _) => None,
-                },
-                (Some(t), Some(b), Some(l), Some(r)) => match (t, b, l, r) {
-                    ('|', '-', '|', '-') => Some(9),
-                    (_, _, _, _) => None,
-                },
-                (_, _, _, _) => None,
-            };
-
-            let energy = tensors.combined.energy_avg() * SOBEL_MAX_RECIPROCAL_SQ;
+            let tensor_combined = tensors.combined();
+            let energy = tensor_combined.energy_avg() * SOBEL_MAX_RECIPROCAL_SQ;
 
             if let Some(i) = special_edge_index {
                 char_indices.push(CHARS.len() + i);
             } else if energy > EDGE_ENERGY_THRESHOLD
-                && tensors.combined.coherence() > EDGE_COHERANCE_THRESHOLD
+                && tensor_combined.coherence() > EDGE_COHERANCE_THRESHOLD
             {
-                char_indices.push(CHARS.len() + angle_to_edge_index(tensors.combined.theta()));
+                char_indices.push(CHARS.len() + angle_to_edge_index(tensor_combined.theta()));
             } else {
                 let brightness_avg = brightness_sum / (cell_w * cell_h) as f32;
                 char_indices.push(
@@ -203,10 +243,14 @@ pub fn process_frame(
                 let char_index = char_indices[index as usize];
 
                 let pixel = unsafe { image.unsafe_get_pixel(x, y) };
-                let text_multiplier = lut[char_atlas[[
-                    char_index as usize,
-                    (y % cell_h * cell_w + x % cell_w) as usize,
-                ]] as usize];
+                let text_multiplier = unsafe {
+                    lut.get_unchecked(
+                        char_atlas[[
+                            char_index as usize,
+                            (y % cell_h * cell_w + x % cell_w) as usize,
+                        ]] as usize,
+                    )
+                };
 
                 buffer.push((pixel[0] as f32 / 255.0 * text_multiplier * 255.0).round() as u8);
                 buffer.push((pixel[1] as f32 / 255.0 * text_multiplier * 255.0).round() as u8);
