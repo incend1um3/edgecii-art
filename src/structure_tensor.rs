@@ -46,10 +46,7 @@ impl CellStructureTensors {
 
     #[inline(always)]
     pub fn combined(&self) -> StructureTensor {
-        self.tl
-            .combine(&self.bl)
-            .combine(&self.tr)
-            .combine(&self.br)
+        self.tl.combine(&self.bl).combine(&self.tr).combine(&self.br)
     }
 
     #[inline]
@@ -112,7 +109,7 @@ impl StructureTensor {
     /// tan 2θ = 2b / (a - c)
     #[inline]
     pub fn theta(&self) -> f32 {
-        0.5 * libm::atan2f(2.0 * self.gxgy, self.gx_squared - self.gy_squared)
+        0.5 * f32::atan2(2.0 * self.gxgy, self.gx_squared - self.gy_squared)
     }
 
     /// Sum of the two eigenvalues
@@ -124,8 +121,8 @@ impl StructureTensor {
     // (λ₁ - λ₂) / (λ₁ + λ₂)
     #[inline]
     pub fn coherence(&self) -> f32 {
-        ((self.gx_squared - self.gy_squared).powi(2) + 4.0 * self.gxgy * self.gxgy).sqrt()
-            / self.trace()
+        let sub = self.gx_squared - self.gy_squared;
+        sub.mul_add(sub, 4.0 * self.gxgy * self.gxgy).sqrt() / self.trace()
     }
 
     #[inline]

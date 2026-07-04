@@ -7,6 +7,7 @@
 # Profiling stuff
 perf.data
 flamegraph.svg
+*.asm
 
 # Large test files
 /test-images/*.webm

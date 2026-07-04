@@ -497,14 +497,12 @@ dependencies = [
  "image",
  "imageproc",
  "infer",
- "libm",
  "linear-srgb",
  "mimalloc",
  "ndarray",
  "num-traits",
  "profiling",
  "rayon",
- "rgb2yuv420",
  "spmc",
  "strum",
  "strum_macros",
@@ -1764,12 +1762,6 @@ name = "rgb"
 version = "0.8.53"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47b34b781b31e5d73e9fbc8689c70551fd1ade9a19e3e28cfec8580a79290cc4"
-
-[[package]]
-name = "rgb2yuv420"
-version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4cf3ad431593a2bb204ed1c609814aa9f95b169f8cef6b811b03261097f2453b"
 
 [[package]]
 name = "ring"

@@ -36,11 +36,6 @@ fn try_special(tensors: &CellStructureTensors) -> Option<usize> {
     const THETA_VERTICAL: f32 = 0.0;
     const THETA_BSLASH: f32 = f32::to_radians(45.0 + 90.0);
 
-    let combined = tensors.combined();
-    if combined.coherence() > EDGE_COHERANCE_THRESHOLD {
-        return None;
-    }
-
     let left = tensors.left();
     let right = tensors.right();
     let top = tensors.top();
@@ -52,9 +47,9 @@ fn try_special(tensors: &CellStructureTensors) -> Option<usize> {
     let br = &tensors.br;
 
     let is_stroke = |tensor: &StructureTensor, angle: f32| {
-        angle_dist(tensor.theta(), angle) < ANGLE_TOLERANCE
-            && tensor.energy_avg() * SOBEL_MAX_RECIPROCAL_SQ > EDGE_ENERGY_THRESHOLD
+        tensor.energy_avg() * SOBEL_MAX_RECIPROCAL_SQ > EDGE_ENERGY_THRESHOLD
             && tensor.coherence() > EDGE_COHERANCE_THRESHOLD * 0.8
+            && angle_dist(tensor.theta(), angle) < ANGLE_TOLERANCE
     };
 
     let is_stroke_junction = |tensor: &StructureTensor, angle: f32| {
@@ -83,9 +78,9 @@ fn try_special(tensors: &CellStructureTensors) -> Option<usize> {
         return Some(8);
     }
     // L
-    if is_stroke_junction(&left, THETA_VERTICAL)
+    if tr.energy_avg() * SOBEL_MAX_RECIPROCAL_SQ < EDGE_ENERGY_THRESHOLD
+        && is_stroke_junction(&left, THETA_VERTICAL)
         && is_stroke(&br, THETA_HORIZONTAL)
-        && tr.energy_avg() * SOBEL_MAX_RECIPROCAL_SQ < EDGE_ENERGY_THRESHOLD
     {
         return Some(9);
     }
@@ -101,7 +96,6 @@ fn try_special(tensors: &CellStructureTensors) -> Option<usize> {
     None
 }
 
-#[profiling::function]
 pub fn process_frame(
     char_atlas: &ndarray::Array2<u8>,
     image: DynamicImage,
@@ -110,7 +104,8 @@ pub fn process_frame(
     debug_output: bool,
 ) -> anyhow::Result<(Vec<usize>, DynamicImage)> {
     let image_luma8 = image.to_luma8();
-    let image_luma_f32 = image.to_luma32f();
+    let temp = image.into_rgb8();
+    let image_raw = temp.as_raw();
 
     let vertical_grad = {
         profiling::scope!("Vertical Sobel");
@@ -125,7 +120,7 @@ pub fn process_frame(
         let angles = vertical_grad
             .pixels()
             .zip(horizontal_grad.pixels())
-            .map(|(y, x)| libm::atan2f(y[0] as f32, x[0] as f32))
+            .map(|(y, x)| f32::atan2(y[0] as f32, x[0] as f32))
             .collect::<Vec<f32>>();
         let angles_img = GrayImage::from_vec(
             image_luma8.width(),
@@ -139,16 +134,15 @@ pub fn process_frame(
 
         angles_img.save("./.debug/angles.png").unwrap();
 
-        let magnitudes =
-            ImageBuffer::from_fn(vertical_grad.width(), vertical_grad.height(), |x, y| {
-                let v = vertical_grad.get_pixel(x, y)[0] as f32;
-                let h = horizontal_grad.get_pixel(x, y)[0] as f32;
-                Luma([(v * v + h * h).sqrt().round().min(255.0) as u8])
-            });
+        let magnitudes = ImageBuffer::from_fn(vertical_grad.width(), vertical_grad.height(), |x, y| {
+            let v = vertical_grad.get_pixel(x, y)[0] as f32;
+            let h = horizontal_grad.get_pixel(x, y)[0] as f32;
+            Luma([(v * v + h * h).sqrt().round().min(255.0) as u8])
+        });
         magnitudes.save("./.debug/sobel.png")?;
 
         ImageBuffer::from_fn(vertical_grad.width(), vertical_grad.height(), |x, y| {
-            let pixel_index = (y * image.width() + x) as usize;
+            let pixel_index = (y * image_luma8.width() + x) as usize;
             let theta = angles[pixel_index]; // -π to π
             let mag = magnitudes.get_pixel(x, y)[0] as f32 / 255.0;
 
@@ -177,20 +171,22 @@ pub fn process_frame(
     let img_width_snapped = (image_luma8.width() / cell_w as u32) * cell_w as u32;
     let img_height_snapped = (image_luma8.height() / cell_h as u32) * cell_h as u32;
 
-    let mut char_indices =
-        Vec::with_capacity((img_width_snapped * img_height_snapped / (cell_w * cell_h)) as usize);
+    let srgb_to_linear_lut: [f32; 256] = std::array::from_fn(|i| srgb_to_linear(i as f32 / 255.0));
+    let mut char_indices = Vec::with_capacity((img_width_snapped * img_height_snapped / (cell_w * cell_h)) as usize);
+
+    let cell_quadrant_w = cell_w / 2;
+    let cell_quadrant_h = cell_h / 2;
+
     for y in (0..(img_height_snapped)).step_by(cell_h as usize) {
         for x in (0..(img_width_snapped)).step_by(cell_w as usize) {
+            let mut tensors = CellStructureTensors::new(cell_w, cell_h);
             let mut brightness_sum = 0.0;
 
-            // structure tensor
-            let mut tensors = CellStructureTensors::new(cell_w, cell_h);
-
+            // TODO: split into four separate quadrants so LLV can autovectorize
             for dy in 0..(cell_h as u32) {
                 for dx in 0..(cell_w as u32) {
-                    // let pixel_index = ((y + dy) * image.width() + x + dx) as usize;
                     brightness_sum += unsafe {
-                        srgb_to_linear(image_luma_f32.unsafe_get_pixel(x + dx, y + dy)[0])
+                        srgb_to_linear_lut.get_unchecked(image_luma8.unsafe_get_pixel(x + dx, y + dy)[0] as usize)
                     };
 
                     let (gx, gy) = unsafe {
@@ -201,60 +197,54 @@ pub fn process_frame(
                     };
 
                     tensors.accumulate(dx, dy, gx, gy);
-
-                    // for char_index in 0..CHARS.len() {
-                    //     let diff = (image_luma8.get_pixel(x + dx, y + dy)[0] as i16
-                    //         - (char_atlas[[char_index, (dy * cell_w as u32 + dx) as usize]]) as i16)
-                    //         .abs() as u32;
-                    //     char_histogram[char_index] += diff;
-                    // }
                 }
             }
 
-            let special_edge_index = try_special(&tensors);
-
             let tensor_combined = tensors.combined();
+            let special_edge_index = if tensor_combined.coherence() < EDGE_COHERANCE_THRESHOLD {
+                try_special(&tensors)
+            } else {
+                None
+            };
+
             let energy = tensor_combined.energy_avg() * SOBEL_MAX_RECIPROCAL_SQ;
 
             if let Some(i) = special_edge_index {
                 char_indices.push(CHARS.len() + i);
-            } else if energy > EDGE_ENERGY_THRESHOLD
-                && tensor_combined.coherence() > EDGE_COHERANCE_THRESHOLD
-            {
+            } else if energy > EDGE_ENERGY_THRESHOLD && tensor_combined.coherence() > EDGE_COHERANCE_THRESHOLD {
                 char_indices.push(CHARS.len() + angle_to_edge_index(tensor_combined.theta()));
             } else {
                 let brightness_avg = brightness_sum / (cell_w * cell_h) as f32;
-                char_indices.push(
-                    ((linear_to_srgb(brightness_avg)) * (CHARS.len() - 1) as f32).round() as usize,
-                );
+                char_indices.push(((linear_to_srgb(brightness_avg)) * (CHARS.len() - 1) as f32).round() as usize);
             }
         }
     }
 
-    let mut buffer = Vec::with_capacity((img_width_snapped * img_height_snapped) as usize);
+    let mut buffer = vec![0u8; (img_width_snapped * img_height_snapped * 3) as usize];
     {
         profiling::scope!("Rendering to Image");
 
-        let lut: [f32; 256] = std::array::from_fn(|i| (i as f32 / 255.0).sqrt());
+        let sqrt_lut: [f32; 256] = std::array::from_fn(|i| (i as f32 / 255.0).sqrt());
+        let cols = img_width_snapped / cell_w;
+
         for y in 0..img_height_snapped {
             for x in 0..img_width_snapped {
-                let cols = img_width_snapped / cell_w;
-                let index = (y / cell_h) * cols + x / cell_w;
-                let char_index = char_indices[index as usize];
+                let char_index = char_indices[((y / cell_h) * cols + x / cell_w) as usize];
+                let pixel_index = ((y * img_width_snapped + x) * 3) as usize;
 
-                let pixel = unsafe { image.unsafe_get_pixel(x, y) };
                 let text_multiplier = unsafe {
-                    lut.get_unchecked(
-                        char_atlas[[
-                            char_index as usize,
-                            (y % cell_h * cell_w + x % cell_w) as usize,
-                        ]] as usize,
+                    sqrt_lut.get_unchecked(
+                        char_atlas[[char_index as usize, (y % cell_h * cell_w + x % cell_w) as usize]] as usize,
                     )
                 };
 
-                buffer.push((pixel[0] as f32 / 255.0 * text_multiplier * 255.0).round() as u8);
-                buffer.push((pixel[1] as f32 / 255.0 * text_multiplier * 255.0).round() as u8);
-                buffer.push((pixel[2] as f32 / 255.0 * text_multiplier * 255.0).round() as u8);
+                let r = unsafe { *image_raw.get_unchecked(pixel_index) };
+                let g = unsafe { *image_raw.get_unchecked(pixel_index + 1) };
+                let b = unsafe { *image_raw.get_unchecked(pixel_index + 2) };
+
+                buffer[pixel_index] = (r as f32 * text_multiplier).round() as u8;
+                buffer[pixel_index + 1] = (g as f32 * text_multiplier).round() as u8;
+                buffer[pixel_index + 2] = (b as f32 * text_multiplier).round() as u8;
             }
         }
     }
