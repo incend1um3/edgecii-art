@@ -24,10 +24,68 @@ pub enum Codec {
     Av1,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum, strum_macros::Display)]
+pub enum Quality {
+    #[strum(serialize = "low")]
+    Low,
+    #[strum(serialize = "balanced")]
+    Balanced,
+    #[strum(serialize = "high")]
+    High,
+    #[strum(serialize = "perceptually_lossless")]
+    PerceptuallyLossless,
+}
+
+impl Quality {
+    /// Constant-quality value on the H.264/H.265 QP / CRF scale (0..=51, LOWER = better).
+    /// Also used for QSV constant quality: `-global_quality` (ICQ) stays on this ~1..=51
+    /// scale for AV1 too (AV1-QSV guides use values like 24 for high quality), so QSV does
+    /// NOT need the wider hardware-AV1 scale below.
+    fn h26x_qp(self) -> u32 {
+        match self {
+            Self::Low => 32,
+            Self::Balanced => 23,
+            Self::High => 19,
+            Self::PerceptuallyLossless => 14,
+        }
+    }
+
+    /// Constant-quality CRF for libsvtav1 (0..=63, LOWER = better).
+    fn av1_crf(self) -> u32 {
+        match self {
+            Self::Low => 45,
+            Self::Balanced => 30,
+            Self::High => 22,
+            Self::PerceptuallyLossless => 16,
+        }
+    }
+
+    /// Constant-QP for the "raw quantizer index" hardware AV1 encoders — `av1_nvenc`,
+    /// `av1_amf`, `av1_vaapi` — whose `-qp`/`-qp_i` run on AV1's 0..=255 q_index scale
+    /// (LOWER = better), NOT H.264/H.265's 0..=51. AOM/SVT map a 0..=63 quantizer onto
+    /// 0..=255 by ×4, so we reuse the libsvtav1 CRF value as that 0..=63 quantizer.
+    /// Note: fixed-function AV1 is less efficient than SVT-AV1 at equal quantizer, so at a
+    /// given `Quality` these will look a touch softer / larger than the software path.
+    /// Does NOT apply to `av1_qsv` (ICQ, see `h26x_qp`) or VideoToolbox (no HW AV1 encoder).
+    fn av1_hw_qp(self) -> u32 {
+        self.av1_crf() * 4
+    }
+
+    /// VideoToolbox `-q:v` quality (1..=100, HIGHER = better — inverted vs. the others).
+    fn videotoolbox_qv(self) -> u32 {
+        match self {
+            Self::Low => 35,
+            Self::Balanced => 50,
+            Self::High => 65,
+            Self::PerceptuallyLossless => 85,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum RateControl {
     /// CRF / CQP / ICQ
-    Constant,
+    Constant(Quality),
     Bitrate {
         avg_kbps: u32,
         max_kbps: Option<u32>,
@@ -77,6 +135,13 @@ impl FfmpegEncoder {
     ) -> anyhow::Result<Self> {
         let (vendor, encoder) = select_encoder(codec, preferred_vendor)
             .ok_or_else(|| anyhow::anyhow!("no working encoder found for {codec:?}"))?;
+
+        if let Some(v) = preferred_vendor
+            && v != vendor
+        {
+            println!("Failed to select {:?} for encoding", v);
+        }
+
         println!("selected encoder: {encoder} (vendor: {vendor:?})");
 
         let (pre_input, pix_or_filter) = hw_setup_args(vendor);
@@ -299,11 +364,25 @@ fn create_rate_and_preset_args(
     let mut push = |args: &[&str]| a.extend(args.iter().map(|s| s.to_string()));
     let q = compression_level.idx();
 
+    // Constant-QP value for the raw-quantizer hardware encoders (nvenc/amf/vaapi): AV1
+    // rides the 0..=255 q_index scale while H.264/H.265 use 0..=51. QSV (ICQ) and
+    // VideoToolbox keep their own scales and don't call this.
+    let hw_const_qp = |quality: Quality| -> u32 {
+        if codec == Codec::Av1 {
+            quality.av1_hw_qp()
+        } else {
+            quality.h26x_qp()
+        }
+    };
+
     match vendor {
         Vendor::Nvenc => {
             push(&["-preset", ["p1", "p4", "p7"][q]]);
             match rate {
-                RateControl::Constant => push(&["-rc", "constqp", "-qp", "23"]),
+                RateControl::Constant(quality) => {
+                    push(&["-rc", "constqp", "-qp"]);
+                    a.push(hw_const_qp(*quality).to_string());
+                }
                 RateControl::Bitrate { avg_kbps, max_kbps } => match max_kbps {
                     Some(m) => {
                         push(&["-rc", "vbr"]);
@@ -325,8 +404,16 @@ fn create_rate_and_preset_args(
         Vendor::Amf => {
             push(&["-quality", ["speed", "balanced", "quality"][q]]);
             match rate {
-                RateControl::Constant => {
-                    push(&["-rc", "cqp", "-qp_i", "23", "-qp_p", "23", "-qp_b", "23"])
+                RateControl::Constant(quality) => {
+                    let qp = hw_const_qp(*quality).to_string();
+                    a.push("-rc".into());
+                    a.push("cqp".into());
+                    a.push("-qp_i".into());
+                    a.push(qp.clone());
+                    a.push("-qp_p".into());
+                    a.push(qp.clone());
+                    a.push("-qp_b".into());
+                    a.push(qp);
                 }
                 RateControl::Bitrate { avg_kbps, max_kbps } => match max_kbps {
                     Some(m) => {
@@ -347,7 +434,11 @@ fn create_rate_and_preset_args(
         Vendor::Qsv => {
             push(&["-preset", ["veryfast", "medium", "veryslow"][q]]);
             match rate {
-                RateControl::Constant => push(&["-global_quality", "23"]), // ICQ
+                RateControl::Constant(quality) => {
+                    // ICQ
+                    a.push("-global_quality".into());
+                    a.push(quality.h26x_qp().to_string());
+                }
                 RateControl::Bitrate { avg_kbps, max_kbps } => {
                     a.push("-b:v".into());
                     a.push(format!("{avg_kbps}k"));
@@ -363,7 +454,10 @@ fn create_rate_and_preset_args(
             // (0 = best quality, 7 = fastest).
             push(&["-compression_level", ["7", "4", "0"][q]]);
             match rate {
-                RateControl::Constant => push(&["-rc_mode", "CQP", "-qp", "23"]),
+                RateControl::Constant(quality) => {
+                    push(&["-rc_mode", "CQP", "-qp"]);
+                    a.push(hw_const_qp(*quality).to_string());
+                }
                 RateControl::Bitrate { avg_kbps, max_kbps } => match max_kbps {
                     Some(m) => {
                         push(&["-rc_mode", "VBR"]);
@@ -386,7 +480,10 @@ fn create_rate_and_preset_args(
             }
             match rate {
                 // -q:v support varies by build/codec; falls back gracefully.
-                RateControl::Constant => push(&["-q:v", "50"]),
+                RateControl::Constant(quality) => {
+                    a.push("-q:v".into());
+                    a.push(quality.videotoolbox_qv().to_string());
+                }
                 RateControl::Bitrate { avg_kbps, max_kbps } => {
                     a.push("-b:v".into());
                     a.push(format!("{avg_kbps}k"));
@@ -404,7 +501,10 @@ fn create_rate_and_preset_args(
                 // libsvtav1: preset 0 (slowest/best) .. 13 (fastest).
                 push(&["-preset", ["10", "6", "2"][q]]);
                 match rate {
-                    RateControl::Constant => push(&["-crf", "30"]),
+                    RateControl::Constant(quality) => {
+                        a.push("-crf".into());
+                        a.push(quality.av1_crf().to_string());
+                    }
                     RateControl::Bitrate { avg_kbps, .. } => {
                         a.push("-b:v".into());
                         a.push(format!("{avg_kbps}k"));
@@ -414,7 +514,10 @@ fn create_rate_and_preset_args(
                 // libx264 / libx265
                 push(&["-preset", ["veryfast", "medium", "veryslow"][q]]);
                 match rate {
-                    RateControl::Constant => push(&["-crf", "23"]),
+                    RateControl::Constant(quality) => {
+                        a.push("-crf".into());
+                        a.push(quality.h26x_qp().to_string());
+                    }
                     RateControl::Bitrate { avg_kbps, max_kbps } => {
                         a.push("-b:v".into());
                         a.push(format!("{avg_kbps}k"));

@@ -35,11 +35,11 @@ mod util;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-/// Convert images to ascii art with edge detection.
+/// Convert images and videos to ascii art with edge detection.
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
-    /// Path to image file
+    /// Path to image/video file
     #[arg(short, long)]
     input: PathBuf,
 
@@ -55,12 +55,12 @@ struct Args {
     #[arg(long, default_value_t = ffmpeg_encoder::CompressionLevel::Balanced)]
     compression_level: ffmpeg_encoder::CompressionLevel,
 
-    /// Average bit rate in kbps when using variable bit rate.
-    #[arg(short, long, default_value_t = 12_000)]
-    bit_rate: u16,
+    /// Quality preset passed to the encoder.
+    #[arg(long, default_value_t = ffmpeg_encoder::Quality::High)]
+    quality: ffmpeg_encoder::Quality,
 
-    // Write debug output images (sobel gradients, angles, etc.) when processing an image. This does not apply to videos.
-    #[arg(short, long)]
+    /// Write debug output images (sobel gradients, angles, etc.) when processing an image. This does not apply to videos.
+    #[arg(short, long, default_value_t = false)]
     debug_output: bool,
 }
 
@@ -168,7 +168,7 @@ fn process_thread(
             }
         };
 
-        let image = DynamicImage::ImageRgb8(video_frame_to_image(&frame));
+        let image = DynamicImage::ImageRgb8(video_frame_to_image(frame));
 
         let (_, render) = {
             profiling::scope!("Process Frame");
@@ -215,10 +215,6 @@ fn create_decoder(file: &Path) -> anyhow::Result<video_rs::Decoder> {
 
     let accelerators_available =
         video_rs::hwaccel::HardwareAccelerationDeviceType::list_available();
-    println!("Available decoders: {:#?}", accelerators_available);
-    if accelerators_available.is_empty() {
-        return Ok(Decoder::new(file)?);
-    }
 
     use video_rs::hwaccel::HardwareAccelerationDeviceType::*;
     let accel_order = [Cuda, D3D11Va, Dxva2, Vdpau, VaApi, Qsv, VideoToolbox];
@@ -238,7 +234,7 @@ fn create_decoder(file: &Path) -> anyhow::Result<video_rs::Decoder> {
             d.seek_to_start()?;
             video_rs::ffmpeg::log::set_level(video_rs::ffmpeg::log::Level::Warning);
 
-            println!("Using hardware accelerated decoding: {:#?}", accel);
+            println!("Using hardware accelerated decoding through {:#?}", accel);
             return Ok(d);
         }
     }
@@ -314,25 +310,18 @@ fn main() -> anyhow::Result<()> {
             out_w, out_h, cell_w, cell_h
         );
 
-        // let encoder = GpuEncoder::new(
-        //     out_w.try_into()?,
-        //     out_h.try_into()?,
-        //     decoder.frame_rate(),
-        //     Path::new("./output/render.h264"),
-        // )?;
         let encoder = FfmpegEncoder::new(
             out_w,
             out_h,
             decoder.frame_rate(),
             PathBuf::from_str("./output/render.mkv")?,
             ffmpeg_encoder::Codec::H265,
-            ffmpeg_encoder::CompressionLevel::Balanced,
-            ffmpeg_encoder::RateControl::Constant,
-            None,
+            args.compression_level,
+            ffmpeg_encoder::RateControl::Constant(args.quality),
+            args.hw_accel,
         )?;
 
         let decoder_handle = std::thread::spawn(move || decode_thread(decoder, decode_tx));
-
         let encoder_handle = std::thread::spawn(move || encode_thread(encoder, encode_rx));
 
         let char_atlas = Arc::new(char_atlas);
@@ -350,6 +339,7 @@ fn main() -> anyhow::Result<()> {
         decoder_handle.join().unwrap();
         worker_handles.into_iter().for_each(|h| h.join().unwrap());
 
+        // Let the encoder thread exit
         drop(encode_tx);
         encoder_handle.join().unwrap();
 
