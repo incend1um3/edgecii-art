@@ -24,6 +24,38 @@ pub enum Codec {
     Av1,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BitDepth {
+    Eight,
+    Ten,
+}
+
+impl BitDepth {
+    /// Semi-planar 4:2:0 format fed to the internal-upload HW encoders
+    /// (nvenc/amf/videotoolbox) and used inside the vaapi/qsv `format=` filter.
+    fn upload_fmt(self) -> &'static str {
+        match self {
+            Self::Eight => "nv12",
+            Self::Ten => "p010le",
+        }
+    }
+
+    /// Planar 4:2:0 format for the pure-software encoders.
+    fn software_fmt(self) -> &'static str {
+        match self {
+            Self::Eight => "yuv420p",
+            Self::Ten => "yuv420p10le",
+        }
+    }
+
+    fn bits(self) -> u32 {
+        match self {
+            Self::Eight => 8,
+            Self::Ten => 10,
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum, strum_macros::Display)]
 pub enum Quality {
     #[strum(serialize = "low")]
@@ -120,6 +152,7 @@ pub struct FfmpegEncoder {
     height: u32,
     vendor: Vendor,
     encoder: String,
+    bit_depth: BitDepth,
 }
 
 impl FfmpegEncoder {
@@ -133,7 +166,7 @@ impl FfmpegEncoder {
         rate: RateControl,
         preferred_vendor: Option<Vendor>,
     ) -> anyhow::Result<Self> {
-        let (vendor, encoder) = select_encoder(codec, preferred_vendor)
+        let (vendor, encoder, bit_depth) = select_encoder(codec, preferred_vendor)
             .ok_or_else(|| anyhow::anyhow!("no working encoder found for {codec:?}"))?;
 
         if let Some(v) = preferred_vendor
@@ -142,9 +175,12 @@ impl FfmpegEncoder {
             println!("Failed to select {:?} for encoding", v);
         }
 
-        println!("selected encoder: {encoder} (vendor: {vendor:?})");
+        println!(
+            "selected encoder: {encoder} (vendor: {vendor:?}, {}-bit)",
+            bit_depth.bits()
+        );
 
-        let (pre_input, pix_or_filter) = hw_setup_args(vendor);
+        let (pre_input, pix_or_filter) = hw_setup_args(vendor, bit_depth);
         let mut args: Vec<String> = Vec::new();
 
         args.extend(["-hide_banner", "-v", "error", "-nostdin"].map(String::from));
@@ -187,15 +223,13 @@ impl FfmpegEncoder {
             height,
             vendor,
             encoder,
+            bit_depth,
         })
     }
 
     pub fn encode_frame(&mut self, frame: ndarray::Array3<u8>) -> anyhow::Result<()> {
         let expected = (self.width * self.height * 3) as usize;
-        let (rgb, _) = frame
-            .as_standard_layout()
-            .to_owned()
-            .into_raw_vec_and_offset();
+        let (rgb, _) = frame.as_standard_layout().to_owned().into_raw_vec_and_offset();
 
         anyhow::ensure!(
             rgb.len() == expected,
@@ -240,6 +274,10 @@ impl FfmpegEncoder {
     pub fn selected_vendor(&self) -> Vendor {
         self.vendor
     }
+
+    pub fn selected_bit_depth(&self) -> BitDepth {
+        self.bit_depth
+    }
 }
 
 impl Drop for FfmpegEncoder {
@@ -274,13 +312,7 @@ fn vendor_order() -> &'static [Vendor] {
         &[Vendor::Nvenc, Vendor::Amf, Vendor::Qsv, Vendor::Software]
     } else {
         // linux / unix-like
-        &[
-            Vendor::Nvenc,
-            Vendor::Vaapi,
-            Vendor::Amf,
-            Vendor::Qsv,
-            Vendor::Software,
-        ]
+        &[Vendor::Nvenc, Vendor::Vaapi, Vendor::Amf, Vendor::Qsv, Vendor::Software]
     }
 }
 
@@ -289,15 +321,14 @@ fn vendor_order() -> &'static [Vendor] {
 ///
 /// The VAAPI device path and QSV device init below are best-effort defaults;
 /// on unusual setups you may need to adjust `/dev/dri/renderD128`.
-fn hw_setup_args(vendor: Vendor) -> (Vec<String>, Vec<String>) {
+fn hw_setup_args(vendor: Vendor, depth: BitDepth) -> (Vec<String>, Vec<String>) {
+    let upload = depth.upload_fmt();
     match vendor {
-        // These uploaders take software P010 (10-bit) frames and upload internally.
-        Vendor::Nvenc | Vendor::Amf | Vendor::VideoToolbox => {
-            (vec![], vec!["-pix_fmt".into(), "p010le".into()])
-        }
+        // These uploaders take software nv12/p010 frames and upload internally.
+        Vendor::Nvenc | Vendor::Amf | Vendor::VideoToolbox => (vec![], vec!["-pix_fmt".into(), upload.into()]),
         Vendor::Vaapi => (
             vec!["-vaapi_device".into(), "/dev/dri/renderD128".into()],
-            vec!["-vf".into(), "format=p010le,hwupload".into()],
+            vec!["-vf".into(), format!("format={upload},hwupload")],
         ),
         Vendor::Qsv => (
             vec![
@@ -306,18 +337,15 @@ fn hw_setup_args(vendor: Vendor) -> (Vec<String>, Vec<String>) {
                 "-filter_hw_device".into(),
                 "hw".into(),
             ],
-            vec![
-                "-vf".into(),
-                "format=p010le,hwupload=extra_hw_frames=64".into(),
-            ],
+            vec!["-vf".into(), format!("format={upload},hwupload=extra_hw_frames=64")],
         ),
-        Vendor::Software => (vec![], vec!["-pix_fmt".into(), "yuv420p10le".into()]),
+        Vendor::Software => (vec![], vec!["-pix_fmt".into(), depth.software_fmt().into()]),
     }
 }
 
-fn run_probe(codec: Codec, vendor: Vendor) -> bool {
+fn run_probe(codec: Codec, vendor: Vendor, depth: BitDepth) -> bool {
     let name = encoder_name(codec, vendor);
-    let (pre_input, pix_or_filter) = hw_setup_args(vendor);
+    let (pre_input, pix_or_filter) = hw_setup_args(vendor, depth);
 
     let mut ffmpeg = Command::new(ffmpeg_path());
     ffmpeg.args(["-hide_banner", "-v", "error", "-nostdin"]);
@@ -326,10 +354,7 @@ fn run_probe(codec: Codec, vendor: Vendor) -> bool {
     ffmpeg.args(&pix_or_filter);
     ffmpeg.args(["-c:v", &name]);
     ffmpeg.args(["-frames:v", "1", "-f", "null", "-"]);
-    ffmpeg
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+    ffmpeg.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
 
     run_with_timeout(ffmpeg, Duration::from_secs(8))
 }
@@ -536,16 +561,23 @@ fn create_rate_and_preset_args(
     a
 }
 
-fn select_encoder(codec: Codec, preferred: Option<Vendor>) -> Option<(Vendor, String)> {
+fn select_encoder(codec: Codec, preferred: Option<Vendor>) -> Option<(Vendor, String, BitDepth)> {
     let mut order: Vec<Vendor> = vendor_order().to_vec();
     if let Some(p) = preferred {
         order.retain(|&v| v != p);
         order.insert(0, p);
     }
 
+    // For each vendor, prefer 10-bit but fall back to 8-bit on the *same*
+    // encoder before moving on. This keeps vendor priority (e.g. staying on a
+    // preferred HW encoder) intact while degrading only the bit depth when the
+    // hardware can't encode 10-bit — e.g. HEVC on VCN 2.x APUs like the 5700G,
+    // which support 10-bit decode but only 8-bit HEVC encode.
     for vendor in order {
-        if run_probe(codec, vendor) {
-            return Some((vendor, encoder_name(codec, vendor)));
+        for depth in [BitDepth::Ten, BitDepth::Eight] {
+            if run_probe(codec, vendor, depth) {
+                return Some((vendor, encoder_name(codec, vendor), depth));
+            }
         }
     }
     None
