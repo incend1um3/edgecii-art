@@ -180,25 +180,60 @@ pub fn process_frame(
     for y in (0..(img_height_snapped)).step_by(cell_h as usize) {
         for x in (0..(img_width_snapped)).step_by(cell_w as usize) {
             let mut tensors = CellStructureTensors::new(cell_w, cell_h);
-            let mut brightness_sum = 0.0;
+            let mut brightness_sum = 0.0f32;
 
-            // TODO: split into four separate quadrants so LLV can autovectorize
-            for dy in 0..(cell_h as u32) {
-                for dx in 0..(cell_w as u32) {
-                    brightness_sum += unsafe {
-                        srgb_to_linear_lut.get_unchecked(image_luma8.unsafe_get_pixel(x + dx, y + dy)[0] as usize)
-                    };
+            let mut loop_fn = |x1: u32, y1: u32, x2: u32, y2: u32, tensor: &mut StructureTensor| {
+                let mut sum_gx_squared = 0;
+                let mut sum_gxgy = 0;
+                let mut sum_gy_squared = 0;
 
-                    let (gx, gy) = unsafe {
-                        (
-                            horizontal_grad.unsafe_get_pixel(x + dx, y + dy)[0] as f32,
-                            vertical_grad.unsafe_get_pixel(x + dx, y + dy)[0] as f32,
-                        )
-                    };
+                for dy in y1..y2 {
+                    for dx in x1..x2 {
+                        brightness_sum = brightness_sum.algebraic_add(unsafe {
+                            *srgb_to_linear_lut.get_unchecked(image_luma8.unsafe_get_pixel(x + dx, y + dy)[0] as usize)
+                        });
 
-                    tensors.accumulate(dx, dy, gx, gy);
+                        let (gx, gy) = unsafe {
+                            (
+                                horizontal_grad.unsafe_get_pixel(x + dx, y + dy)[0],
+                                vertical_grad.unsafe_get_pixel(x + dx, y + dy)[0],
+                            )
+                        };
+
+                        sum_gx_squared += gx as i32 * gx as i32;
+                        sum_gxgy += gx as i32 * gy as i32;
+                        sum_gy_squared += gy as i32 * gy as i32;
+                    }
                 }
-            }
+
+                tensor.gx_squared = sum_gx_squared as f32;
+                tensor.gxgy = sum_gxgy as f32;
+                tensor.gy_squared = sum_gy_squared as f32;
+            };
+
+            // Loop over each quadrant individually so there's no branching, allowing for autovectorization
+            loop_fn(0, 0, cell_quadrant_w, cell_quadrant_h, &mut tensors.tl);
+            loop_fn(
+                cell_quadrant_w,
+                0,
+                cell_quadrant_w * 2,
+                cell_quadrant_h,
+                &mut tensors.tr,
+            );
+            loop_fn(
+                0,
+                cell_quadrant_h,
+                cell_quadrant_w,
+                cell_quadrant_h * 2,
+                &mut tensors.bl,
+            );
+            loop_fn(
+                cell_quadrant_w,
+                cell_quadrant_h,
+                cell_quadrant_w * 2,
+                cell_quadrant_h * 2,
+                &mut tensors.br,
+            );
 
             let tensor_combined = tensors.combined();
             let special_edge_index = if tensor_combined.coherence() < EDGE_COHERANCE_THRESHOLD {
@@ -224,27 +259,33 @@ pub fn process_frame(
     {
         profiling::scope!("Rendering to Image");
 
-        let sqrt_lut: [f32; 256] = std::array::from_fn(|i| (i as f32 / 255.0).sqrt());
         let cols = img_width_snapped / cell_w;
 
-        for y in 0..img_height_snapped {
-            for x in 0..img_width_snapped {
-                let char_index = char_indices[((y / cell_h) * cols + x / cell_w) as usize];
-                let pixel_index = ((y * img_width_snapped + x) * 3) as usize;
+        for y in (0..img_height_snapped).step_by(cell_h as usize) {
+            for x in (0..img_width_snapped).step_by(cell_w as usize) {
+                let cell_x = x / cell_w;
+                let cell_y = y / cell_h;
+                let char_index = char_indices[(cell_y * cols + cell_x) as usize];
+                let atlas_row = char_atlas.row(char_index);
 
-                let text_multiplier = unsafe {
-                    sqrt_lut.get_unchecked(
-                        char_atlas[[char_index as usize, (y % cell_h * cell_w + x % cell_w) as usize]] as usize,
-                    )
-                };
+                for dy in 0..cell_h {
+                    for dx in 0..cell_w {
+                        let pixel_index = (((y + dy) * img_width_snapped + x + dx) * 3) as usize;
 
-                let r = unsafe { *image_raw.get_unchecked(pixel_index) };
-                let g = unsafe { *image_raw.get_unchecked(pixel_index + 1) };
-                let b = unsafe { *image_raw.get_unchecked(pixel_index + 2) };
+                        let multiplier = atlas_row[(dy * cell_w + dx) as usize] as f32 / 255.0;
 
-                buffer[pixel_index] = (r as f32 * text_multiplier).round() as u8;
-                buffer[pixel_index + 1] = (g as f32 * text_multiplier).round() as u8;
-                buffer[pixel_index + 2] = (b as f32 * text_multiplier).round() as u8;
+                        let r = unsafe { *image_raw.get_unchecked(pixel_index) };
+                        let g = unsafe { *image_raw.get_unchecked(pixel_index + 1) };
+                        let b = unsafe { *image_raw.get_unchecked(pixel_index + 2) };
+
+                        buffer[pixel_index] =
+                            unsafe { multiplier.algebraic_mul(r as f32).round().to_int_unchecked::<u8>() };
+                        buffer[pixel_index + 1] =
+                            unsafe { multiplier.algebraic_mul(g as f32).round().to_int_unchecked::<u8>() };
+                        buffer[pixel_index + 2] =
+                            unsafe { multiplier.algebraic_mul(b as f32).round().to_int_unchecked::<u8>() };
+                    }
+                }
             }
         }
     }

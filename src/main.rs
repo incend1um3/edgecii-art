@@ -1,3 +1,5 @@
+#![feature(float_algebraic)]
+
 use clap::Parser;
 use ffmpeg_sidecar::download::FfmpegDownloadProgressEvent;
 use image::{DynamicImage, GrayImage};
@@ -6,7 +8,7 @@ use std::io::Write;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{
     ops::Sub,
     path::{Path, PathBuf},
@@ -68,10 +70,7 @@ fn _compare_slices<T>(a: &[T], b: &[T]) -> T
 where
     T: Copy + Sub<Output = T> + std::iter::Sum + num_traits::Signed,
 {
-    a.iter()
-        .zip(b.iter())
-        .map(|(pa, pb)| (*pb - *pa).abs())
-        .sum()
+    a.iter().zip(b.iter()).map(|(pa, pb)| (*pb - *pa).abs()).sum()
 }
 
 static FRAMES_IN_QUEUE: AtomicU32 = AtomicU32::new(0);
@@ -103,12 +102,7 @@ fn decode_thread(mut decoder: Decoder, mut tx: spmc::Sender<DecoderThreadOutput>
             std::thread::sleep(Duration::from_millis(400));
         }
 
-        tx.send(DecoderThreadOutput::Data {
-            id,
-            timestamp,
-            frame,
-        })
-        .unwrap();
+        tx.send(DecoderThreadOutput::Data { id, timestamp, frame }).unwrap();
 
         FRAMES_IN_QUEUE.fetch_add(1, Ordering::Relaxed);
         id += 1;
@@ -121,6 +115,7 @@ fn encode_thread(mut encoder: FfmpegEncoder, rx: mpsc::Receiver<ProcessedFrame>)
     let mut queue = HashMap::<u32, ProcessedFrame>::new();
     let mut next = 0u32;
 
+    let mut timestamp = Instant::now();
     while let Ok(data) = rx.recv() {
         queue.insert(data.id, data);
 
@@ -133,8 +128,11 @@ fn encode_thread(mut encoder: FfmpegEncoder, rx: mpsc::Receiver<ProcessedFrame>)
             next += 1;
 
             if next % 30 == 0 {
-                print!("Processed {} frames\r", next);
+                let fps = 30.0 / timestamp.elapsed().as_secs_f32();
+                print!("Processed {} frames, fps: {:.2}\t\r", next, fps);
                 std::io::stdout().flush().unwrap();
+
+                timestamp = Instant::now();
             }
         }
     }
@@ -156,11 +154,7 @@ fn process_thread(
             profiling::scope!("Wait for Decode");
             if let Ok(d) = rx.recv() {
                 match d {
-                    DecoderThreadOutput::Data {
-                        id,
-                        timestamp,
-                        frame,
-                    } => (id, timestamp, frame),
+                    DecoderThreadOutput::Data { id, timestamp, frame } => (id, timestamp, frame),
                     DecoderThreadOutput::End => return,
                 }
             } else {
@@ -213,20 +207,15 @@ fn create_decoder(file: &Path) -> anyhow::Result<video_rs::Decoder> {
         anyhow::bail!("Input file not found: {}", file.display());
     }
 
-    let accelerators_available =
-        video_rs::hwaccel::HardwareAccelerationDeviceType::list_available();
+    let accelerators_available = video_rs::hwaccel::HardwareAccelerationDeviceType::list_available();
 
     use video_rs::hwaccel::HardwareAccelerationDeviceType::*;
     let accel_order = [Cuda, D3D11Va, Dxva2, Vdpau, VaApi, Qsv, VideoToolbox];
-    let accelerators_available = accel_order
-        .iter()
-        .filter(|a| accelerators_available.contains(a));
+    let accelerators_available = accel_order.iter().filter(|a| accelerators_available.contains(a));
 
     video_rs::ffmpeg::log::set_level(video_rs::ffmpeg::log::Level::Quiet);
     for accel in accelerators_available {
-        let decoder = DecoderBuilder::new(file)
-            .with_hardware_acceleration(*accel)
-            .build();
+        let decoder = DecoderBuilder::new(file).with_hardware_acceleration(*accel).build();
 
         if let Ok(mut d) = decoder
             && d.decode_raw().is_ok()
@@ -305,10 +294,7 @@ fn main() -> anyhow::Result<()> {
         let (src_w, src_h) = decoder.size();
         let out_w = ((src_w / cell_w) * cell_w) & !1;
         let out_h = ((src_h / cell_h) * cell_h) & !1;
-        eprintln!(
-            "out_w={} out_h={} cell_w={} cell_h={}",
-            out_w, out_h, cell_w, cell_h
-        );
+        eprintln!("out_w={} out_h={} cell_w={} cell_h={}", out_w, out_h, cell_w, cell_h);
 
         let encoder = FfmpegEncoder::new(
             out_w,
@@ -330,9 +316,7 @@ fn main() -> anyhow::Result<()> {
                 let rx = decode_rx.clone();
                 let tx = encode_tx.clone();
                 let atlas = Arc::clone(&char_atlas);
-                std::thread::spawn(move || {
-                    process_thread(atlas, cell_w, cell_h, out_w, out_h, rx, tx)
-                })
+                std::thread::spawn(move || process_thread(atlas, cell_w, cell_h, out_w, out_h, rx, tx))
             })
             .collect();
 

@@ -74,11 +74,11 @@ impl CellStructureTensors {
 pub struct StructureTensor {
     pixels: u32,
     /// ∑ gx^2
-    gx_squared: f32,
+    pub gx_squared: f32,
     /// ∑ gxgy
-    gxgy: f32,
+    pub gxgy: f32,
     /// ∑ gy^2
-    gy_squared: f32,
+    pub gy_squared: f32,
 }
 
 impl StructureTensor {

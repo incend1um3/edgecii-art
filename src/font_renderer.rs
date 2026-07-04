@@ -38,7 +38,9 @@ pub fn render_fonts_to_atlas(char_height: u32) -> anyhow::Result<(ndarray::Array
                 let ty = y_offset + y;
                 let tx = left + x_offset + x;
                 if ty >= 0 && (ty as u32) < cell_h && tx >= 0 && (tx as u32) < cell_w {
-                    char_atlas[[i, (ty * cell_w as i32 + tx) as usize]] = buf[j];
+                    // precompute the gamma correction
+                    let pixel = ((buf[j] as f32 / 255.0).sqrt() * 255.0).min(255.0);
+                    char_atlas[[i, (ty * cell_w as i32 + tx) as usize]] = pixel as u8;
                 }
                 j += 1;
             }
