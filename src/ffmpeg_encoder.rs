@@ -1,6 +1,6 @@
 use std::{
     io::Write,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
     time::{Duration, Instant},
 };
@@ -17,10 +17,13 @@ pub enum Vendor {
     Software,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, IntoStaticStr)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, IntoStaticStr, clap::ValueEnum, strum_macros::Display)]
 pub enum Codec {
+    #[strum(serialize = "h264")]
     H264,
+    #[strum(serialize = "h265")]
     H265,
+    #[strum(serialize = "av1")]
     Av1,
 }
 
@@ -161,6 +164,7 @@ impl FfmpegEncoder {
         height: u32,
         fps: f32,
         output: PathBuf,
+        audio_source: &Path,
         codec: Codec,
         quality: CompressionLevel,
         rate: RateControl,
@@ -192,6 +196,9 @@ impl FfmpegEncoder {
         args.push("-r".into());
         args.push(format!("{fps}"));
         args.extend(["-i", "pipe:0"].map(String::from));
+        // Original file as a second input, taken only for its audio (and subs).
+        args.push("-i".into());
+        args.push(audio_source.to_string_lossy().into_owned());
         // Output pixel format / upload filter for the chosen backend.
         args.extend(pix_or_filter);
         // The encoder itself.
@@ -199,6 +206,11 @@ impl FfmpegEncoder {
         args.push(encoder.clone());
         // Rate control + preset.
         args.extend(create_rate_and_preset_args(codec, vendor, quality, &rate));
+        // Video from the rawvideo pipe (input 0), audio from the original file
+        // (input 1). `?` on the audio map is a no-op if the source is silent, so
+        // we don't fail the whole encode after piping every frame. `-shortest`
+        // trims trailing audio so a CFR render and its audio stay aligned.
+        args.extend(["-map", "0:v:0", "-map", "1:a?", "-c:a", "copy", "-shortest"].map(String::from));
         // Overwrite output.
         args.push("-y".into());
         args.push(output.to_string_lossy().into_owned());

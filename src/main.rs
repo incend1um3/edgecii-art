@@ -61,9 +61,9 @@ struct Args {
     #[arg(long, default_value_t = ffmpeg_encoder::Quality::High)]
     quality: ffmpeg_encoder::Quality,
 
-    /// Write debug output images (sobel gradients, angles, etc.) when processing an image. This does not apply to videos.
-    #[arg(short, long, default_value_t = false)]
-    debug_output: bool,
+    /// Video codec
+    #[arg(short, long, default_value_t = ffmpeg_encoder::Codec::H265)]
+    codec: ffmpeg_encoder::Codec,
 }
 
 fn _compare_slices<T>(a: &[T], b: &[T]) -> T
@@ -86,7 +86,6 @@ enum DecoderThreadOutput {
 
 struct ProcessedFrame {
     id: u32,
-    timestamp: video_rs::Time,
     frame: ndarray::Array3<u8>,
 }
 
@@ -150,7 +149,7 @@ fn process_thread(
     tx: mpsc::Sender<ProcessedFrame>,
 ) {
     loop {
-        let (id, timestamp, frame) = {
+        let (id, _timestamp, frame) = {
             profiling::scope!("Wait for Decode");
             if let Ok(d) = rx.recv() {
                 match d {
@@ -173,7 +172,6 @@ fn process_thread(
 
         tx.send(ProcessedFrame {
             id,
-            timestamp,
             frame: image_to_frame(&render),
         })
         .unwrap();
@@ -188,18 +186,20 @@ fn download_ffmpeg() {
                 total_bytes,
                 downloaded_bytes,
             } => format!(
-                "Downloading: {} kiB / {} kiB\t\t",
+                "Downloading FFMPEG binaries: {:.1} kiB / {:.1} kiB",
+                downloaded_bytes as f32 / 1024.0,
                 total_bytes as f32 / 1024.0,
-                downloaded_bytes as f32 / 1024.0
             ),
             FfmpegDownloadProgressEvent::UnpackingArchive => "Unpacking..".into(),
             FfmpegDownloadProgressEvent::Done => "Done!\n".into(),
         };
 
-        print!("Downloading FFMPEG binaries: {}\r", message);
+        print!("{}\t\t\t\r", message);
         let _ = std::io::stdout().flush();
     })
     .unwrap();
+
+    println!();
 }
 
 fn create_decoder(file: &Path) -> anyhow::Result<video_rs::Decoder> {
@@ -301,7 +301,8 @@ fn main() -> anyhow::Result<()> {
             out_h,
             decoder.frame_rate(),
             PathBuf::from_str("./output/render.mkv")?,
-            ffmpeg_encoder::Codec::H265,
+            &args.input,
+            args.codec,
             args.compression_level,
             ffmpeg_encoder::RateControl::Constant(args.quality),
             args.hw_accel,

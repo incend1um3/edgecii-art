@@ -502,7 +502,6 @@ dependencies = [
  "ndarray",
  "num-traits",
  "profiling",
- "rayon",
  "spmc",
  "strum",
  "strum_macros",

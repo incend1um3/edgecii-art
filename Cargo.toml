@@ -16,7 +16,6 @@ mimalloc = "0.1.52"
 ndarray = "0.17.2"
 num-traits = "0.2.19"
 profiling = { version = "1.0.18" }
-rayon = "1.12.0"
 spmc = "0.3.0"
 video-rs = { version = "0.11.0", features = ["ndarray"] }
 strum = "0.28"
@@ -27,4 +26,6 @@ opt-level = 1
 
 [profile.release]
 opt-level = 3
-debug = true
+lto = true
+codegen-units = 1
+strip = true
