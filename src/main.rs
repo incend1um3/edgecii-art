@@ -1,23 +1,17 @@
-#![feature(float_algebraic)]
-
 use clap::Parser;
 use ffmpeg_sidecar::download::FfmpegDownloadProgressEvent;
-use image::{DynamicImage, GrayImage};
+use image::{DynamicImage, GrayImage, RgbImage};
 use std::collections::HashMap;
 use std::io::Write;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
-use std::{
-    ops::Sub,
-    path::{Path, PathBuf},
-    process,
-};
-use video_rs::{Decoder, DecoderBuilder};
+use std::{ops::Sub, path::PathBuf, process};
 
+use crate::ffmpeg_decoder::FfmpegVideoDecoder;
 use crate::ffmpeg_encoder::FfmpegEncoder;
-use crate::util::{image_to_frame, video_frame_to_image};
+use crate::util::image_to_frame;
 use crate::{
     algorithm::{CHARS, EDGE_CHARS},
     font_renderer::render_fonts_to_atlas,
@@ -28,6 +22,7 @@ use mimalloc::MiMalloc;
 extern crate strum_macros;
 
 mod algorithm;
+mod ffmpeg_decoder;
 mod ffmpeg_encoder;
 mod font_renderer;
 mod structure_tensor;
@@ -76,11 +71,7 @@ where
 static FRAMES_IN_QUEUE: AtomicU32 = AtomicU32::new(0);
 
 enum DecoderThreadOutput {
-    Data {
-        id: u32,
-        timestamp: video_rs::Time,
-        frame: ndarray::Array3<u8>,
-    },
+    Data { id: u32, frame: RgbImage },
     End,
 }
 
@@ -89,25 +80,31 @@ struct ProcessedFrame {
     frame: ndarray::Array3<u8>,
 }
 
-fn decode_thread(mut decoder: Decoder, mut tx: spmc::Sender<DecoderThreadOutput>) {
+fn decode_thread(mut decoder: FfmpegVideoDecoder, mut tx: spmc::Sender<DecoderThreadOutput>) {
     let mut id = 0u32;
-    for frame in decoder.decode_iter() {
-        let (timestamp, frame) = match frame {
-            Ok(f) => f,
-            Err(_) => break,
+    loop {
+        let frame = match decoder.next_frame() {
+            Ok(Some(frame)) => frame,
+            Ok(None) => break,
+            Err(e) => {
+                eprintln!("decode stopped early: {e}");
+                break;
+            }
         };
 
         while FRAMES_IN_QUEUE.load(Ordering::Relaxed) > 24 {
             std::thread::sleep(Duration::from_millis(400));
         }
 
-        tx.send(DecoderThreadOutput::Data { id, timestamp, frame }).unwrap();
+        tx.send(DecoderThreadOutput::Data { id, frame }).unwrap();
 
         FRAMES_IN_QUEUE.fetch_add(1, Ordering::Relaxed);
         id += 1;
     }
 
-    tx.send(DecoderThreadOutput::End).unwrap();
+    for _ in 0..(std::thread::available_parallelism.get().unwrap()) {
+        let _ = tx.send(DecoderThreadOutput::End);
+    }
 }
 
 fn encode_thread(mut encoder: FfmpegEncoder, rx: mpsc::Receiver<ProcessedFrame>) {
@@ -149,11 +146,11 @@ fn process_thread(
     tx: mpsc::Sender<ProcessedFrame>,
 ) {
     loop {
-        let (id, _timestamp, frame) = {
+        let (id, frame) = {
             profiling::scope!("Wait for Decode");
             if let Ok(d) = rx.recv() {
                 match d {
-                    DecoderThreadOutput::Data { id, timestamp, frame } => (id, timestamp, frame),
+                    DecoderThreadOutput::Data { id, frame } => (id, frame),
                     DecoderThreadOutput::End => return,
                 }
             } else {
@@ -161,18 +158,16 @@ fn process_thread(
             }
         };
 
-        let image = DynamicImage::ImageRgb8(video_frame_to_image(frame));
-
         let (_, render) = {
             profiling::scope!("Process Frame");
-            algorithm::process_frame(&char_atlas, image, cell_w, cell_h, false).unwrap()
+            algorithm::process_frame(&char_atlas, DynamicImage::ImageRgb8(frame), cell_w, cell_h, false).unwrap()
         };
 
         let render = image::imageops::crop_imm(&render.to_rgb8(), 0, 0, out_w, out_h).to_image();
 
         tx.send(ProcessedFrame {
             id,
-            frame: image_to_frame(&render),
+            frame: image_to_frame(render),
         })
         .unwrap();
     }
@@ -200,39 +195,6 @@ fn download_ffmpeg() {
     .unwrap();
 
     println!();
-}
-
-fn create_decoder(file: &Path) -> anyhow::Result<video_rs::Decoder> {
-    if !file.exists() || !file.is_file() {
-        anyhow::bail!("Input file not found: {}", file.display());
-    }
-
-    let accelerators_available = video_rs::hwaccel::HardwareAccelerationDeviceType::list_available();
-
-    use video_rs::hwaccel::HardwareAccelerationDeviceType::*;
-    let accel_order = [Cuda, D3D11Va, Dxva2, Vdpau, VaApi, Qsv, VideoToolbox];
-    let accelerators_available = accel_order.iter().filter(|a| accelerators_available.contains(a));
-
-    video_rs::ffmpeg::log::set_level(video_rs::ffmpeg::log::Level::Quiet);
-    for accel in accelerators_available {
-        let decoder = DecoderBuilder::new(file).with_hardware_acceleration(*accel).build();
-
-        if let Ok(mut d) = decoder
-            && d.decode_raw().is_ok()
-        {
-            d.seek_to_start()?;
-            video_rs::ffmpeg::log::set_level(video_rs::ffmpeg::log::Level::Warning);
-
-            println!("Using hardware accelerated decoding through {:#?}", accel);
-            return Ok(d);
-        }
-    }
-
-    println!(
-        "Warning: using software decoding because no working hardware decoder implementation was found. This will be EXTREMELY slow!"
-    );
-    video_rs::ffmpeg::log::set_level(video_rs::ffmpeg::log::Level::Warning);
-    Ok(Decoder::new(file)?)
 }
 
 fn main() -> anyhow::Result<()> {
@@ -289,7 +251,7 @@ fn main() -> anyhow::Result<()> {
         let (decode_tx, decode_rx) = spmc::channel();
         let (encode_tx, encode_rx) = mpsc::channel();
 
-        let decoder = create_decoder(&args.input)?;
+        let decoder = ffmpeg_decoder::create_decoder(&args.input)?;
 
         let (src_w, src_h) = decoder.size();
         let out_w = ((src_w / cell_w) * cell_w) & !1;
@@ -299,7 +261,7 @@ fn main() -> anyhow::Result<()> {
         let encoder = FfmpegEncoder::new(
             out_w,
             out_h,
-            decoder.frame_rate(),
+            decoder.frame_rate_rational(),
             PathBuf::from_str("./output/render.mkv")?,
             &args.input,
             args.codec,

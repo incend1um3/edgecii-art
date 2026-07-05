@@ -2,10 +2,12 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use ffmpeg_sidecar::paths::ffmpeg_path;
+
+use crate::util;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, IntoStaticStr, clap::ValueEnum)]
 pub enum Vendor {
@@ -162,7 +164,7 @@ impl FfmpegEncoder {
     pub fn new(
         width: u32,
         height: u32,
-        fps: f32,
+        fps: &str,
         output: PathBuf,
         audio_source: &Path,
         codec: Codec,
@@ -194,7 +196,7 @@ impl FfmpegEncoder {
         args.extend(["-f", "rawvideo", "-pix_fmt", "rgb24", "-s"].map(String::from));
         args.push(format!("{width}x{height}"));
         args.push("-r".into());
-        args.push(format!("{fps}"));
+        args.push(fps.to_string());
         args.extend(["-i", "pipe:0"].map(String::from));
         // Original file as a second input, taken only for its audio (and subs).
         args.push("-i".into());
@@ -368,27 +370,7 @@ fn run_probe(codec: Codec, vendor: Vendor, depth: BitDepth) -> bool {
     ffmpeg.args(["-frames:v", "1", "-f", "null", "-"]);
     ffmpeg.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
 
-    run_with_timeout(ffmpeg, Duration::from_secs(8))
-}
-
-fn run_with_timeout(mut cmd: Command, timeout: Duration) -> bool {
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    let start = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(s)) => return s.success(),
-            Ok(None) if start.elapsed() >= timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return false;
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-            Err(_) => return false,
-        }
-    }
+    util::run_with_timeout(ffmpeg, Duration::from_secs(8))
 }
 
 fn create_rate_and_preset_args(
