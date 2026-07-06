@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
-use std::time::Duration;
 
 use ffmpeg_sidecar::paths::ffmpeg_path;
 use image::RgbImage;
@@ -21,6 +20,7 @@ pub struct FfmpegVideoDecoder {
     fps_rational: String,
     frame_size: usize,
     finished: bool,
+    pub is_software: bool,
 }
 
 impl FfmpegVideoDecoder {
@@ -146,6 +146,7 @@ pub fn create_decoder(file: &Path) -> anyhow::Result<FfmpegVideoDecoder> {
         fps_rational: meta.fps_rational,
         frame_size: (meta.width as usize) * (meta.height as usize) * 3,
         finished: false,
+        is_software: hwaccel.is_none(),
     })
 }
 
@@ -276,7 +277,7 @@ fn test_decode(file: &Path, hwaccel: &str) -> bool {
     .stdout(Stdio::null())
     .stderr(Stdio::piped());
 
-    let Some((success, stderr)) = util::run_with_timeout_captured(cmd, Duration::from_secs(8)) else {
+    let Some((success, stderr)) = util::run_with_timeout_captured(cmd, util::PROBE_TIMEOUT) else {
         return false;
     };
     if !success {

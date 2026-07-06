@@ -13,6 +13,14 @@ pub fn render_fonts_to_atlas(char_height: u32) -> anyhow::Result<(ndarray::Array
     let cell_w = (size_metrics.max_advance >> 6) as u32;
     let cell_h = (size_metrics.height >> 6) as u32;
 
+    if cell_w % 2 != 0 || cell_h % 2 != 0 {
+        anyhow::bail!(
+            "Failed to create atlas: cell size is {}x{} when both dimensions should be even! Try again with a different --char-height argument (such as 13, 16 or 23).",
+            cell_w,
+            cell_h
+        )
+    }
+
     // holds rendered font bitmaps
     let mut char_atlas: ndarray::Array2<u8> =
         ndarray::Array2::zeros((CHARS.len() + EDGE_CHARS.len(), (cell_h * cell_w) as usize));

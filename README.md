@@ -138,4 +138,4 @@ See [LICENSE](LICENSE)
 
 ## LLM Usage
 
-[src/ffmpeg_encoder.rs](src/ffmpeg_encoder.rs) was mostly written by Claude.
+[src/ffmpeg_encoder.rs](src/ffmpeg_encoder.rs) and [src/ffmpeg_decoder.rs](src/ffmpeg_decoder.rs) were mostly written by Claude, with manual cleanup and testing done afterwards.

@@ -4,3 +4,12 @@ rustc-wrapper = "sccache"
 [target.x86_64-unknown-linux-gnu]
 linker = "clang"
 rustflags = ["-C", "link-arg=-fuse-ld=mold", "-C", "target-cpu=x86-64-v3"]
+
+[target.'cfg(all(windows, target_arch = "x86_64"))']
+rustflags = ["-C", "target-cpu=x86-64-v3"]
+
+[target.'cfg(all(target_os = "macos", target_arch = "x86_64"))']
+rustflags = ["-C", "target-cpu=x86-64-v3"]
+
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))']
+rustflags = ["-C", "target-cpu=apple-m1"]

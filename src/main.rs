@@ -3,15 +3,14 @@ use ffmpeg_sidecar::download::FfmpegDownloadProgressEvent;
 use image::{DynamicImage, GrayImage, RgbImage};
 use std::collections::HashMap;
 use std::io::Write;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
-use std::{ops::Sub, path::PathBuf, process};
 
 use crate::ffmpeg_decoder::FfmpegVideoDecoder;
 use crate::ffmpeg_encoder::FfmpegEncoder;
-use crate::util::image_to_frame;
 use crate::{
     algorithm::{CHARS, EDGE_CHARS},
     font_renderer::render_fonts_to_atlas,
@@ -41,7 +40,7 @@ struct Args {
     input: PathBuf,
 
     /// Height of characters passed to FreeType (this may be different from the actual height of rendered cells)
-    #[arg(short, long)]
+    #[arg(long, value_parser = clap::value_parser!(u8).range(6..=100))]
     char_height: u8,
 
     /// Hardware accelerator to use for the encoder. Automatically defaults to a suitable one supported by the system.
@@ -61,13 +60,6 @@ struct Args {
     codec: ffmpeg_encoder::Codec,
 }
 
-fn _compare_slices<T>(a: &[T], b: &[T]) -> T
-where
-    T: Copy + Sub<Output = T> + std::iter::Sum + num_traits::Signed,
-{
-    a.iter().zip(b.iter()).map(|(pa, pb)| (*pb - *pa).abs()).sum()
-}
-
 static FRAMES_IN_QUEUE: AtomicU32 = AtomicU32::new(0);
 
 enum DecoderThreadOutput {
@@ -77,7 +69,7 @@ enum DecoderThreadOutput {
 
 struct ProcessedFrame {
     id: u32,
-    frame: ndarray::Array3<u8>,
+    frame: RgbImage,
 }
 
 fn decode_thread(mut decoder: FfmpegVideoDecoder, mut tx: spmc::Sender<DecoderThreadOutput>) {
@@ -102,7 +94,7 @@ fn decode_thread(mut decoder: FfmpegVideoDecoder, mut tx: spmc::Sender<DecoderTh
         id += 1;
     }
 
-    for _ in 0..(std::thread::available_parallelism.get().unwrap()) {
+    for _ in 0..(std::thread::available_parallelism().unwrap().get()) {
         let _ = tx.send(DecoderThreadOutput::End);
     }
 }
@@ -117,7 +109,7 @@ fn encode_thread(mut encoder: FfmpegEncoder, rx: mpsc::Receiver<ProcessedFrame>)
 
         while let Some(data) = queue.remove(&next) {
             profiling::scope!("Encode");
-            encoder.encode_frame(data.frame).unwrap();
+            encoder.encode_frame(data.frame.into_raw()).unwrap();
             profiling::finish_frame!();
 
             FRAMES_IN_QUEUE.fetch_sub(1, Ordering::Relaxed);
@@ -163,13 +155,9 @@ fn process_thread(
             algorithm::process_frame(&char_atlas, DynamicImage::ImageRgb8(frame), cell_w, cell_h, false).unwrap()
         };
 
-        let render = image::imageops::crop_imm(&render.to_rgb8(), 0, 0, out_w, out_h).to_image();
+        let render = image::imageops::crop_imm(&render.into_rgb8(), 0, 0, out_w, out_h).to_image();
 
-        tx.send(ProcessedFrame {
-            id,
-            frame: image_to_frame(render),
-        })
-        .unwrap();
+        tx.send(ProcessedFrame { id, frame: render }).unwrap();
     }
 }
 
@@ -205,32 +193,30 @@ fn main() -> anyhow::Result<()> {
     }
     let _ = std::fs::create_dir("./output");
 
-    let file_bytes = std::fs::read(&args.input)?;
-    let is_video = if infer::is_image(&file_bytes) {
-        false
-    } else if infer::is_video(&file_bytes) {
-        true
-    } else {
-        println!("Unrecognized input file format");
-        process::exit(-1);
+    let is_video = match infer::get_from_path(&args.input)?.map(|t| t.matcher_type()) {
+        Some(infer::MatcherType::Video) => true,
+        Some(infer::MatcherType::Image) => false,
+        _ => anyhow::bail!("Unsupported input file format"),
     };
 
     let (char_atlas, cell_w, cell_h) = render_fonts_to_atlas(args.char_height as u32)?;
 
     if cfg!(debug_assertions) {
         let (data, _offset) = char_atlas.clone().into_raw_vec_and_offset();
-        let atlas_img = GrayImage::from_raw(
-            cell_w as u32,
-            ((CHARS.len() + EDGE_CHARS.len()) as u32 * cell_h) as u32,
-            data,
-        )
-        .expect("buffer size matches dimensions");
+        let atlas_img = GrayImage::from_raw(cell_w, (CHARS.len() + EDGE_CHARS.len()) as u32 * cell_h, data)
+            .expect("buffer size matches dimensions");
 
         atlas_img.save("./.debug/atlas_vertical.png")?;
     }
 
     if !is_video {
-        let image = image::load_from_memory(&file_bytes)?;
+        let image = image::open(&args.input)?;
+
+        if image.width() < cell_w * 4 || image.height() < cell_h * 4 {
+            anyhow::bail!(
+                "Source media dimensions are too small relative to character size! Try lowering --char-height or using a larger image/video."
+            );
+        }
 
         let (char_indices, image) =
             algorithm::process_frame(&char_atlas, image, cell_w, cell_h, cfg!(debug_assertions))?;
@@ -256,6 +242,13 @@ fn main() -> anyhow::Result<()> {
         let (src_w, src_h) = decoder.size();
         let out_w = ((src_w / cell_w) * cell_w) & !1;
         let out_h = ((src_h / cell_h) * cell_h) & !1;
+
+        if src_w < cell_w * 4 || src_h < cell_h * 4 {
+            anyhow::bail!(
+                "Source media dimensions are too small relative to character size! Try lowering --char-height or using a larger image/video."
+            );
+        }
+
         eprintln!("out_w={} out_h={} cell_w={} cell_h={}", out_w, out_h, cell_w, cell_h);
 
         let encoder = FfmpegEncoder::new(
@@ -270,11 +263,22 @@ fn main() -> anyhow::Result<()> {
             args.hw_accel,
         )?;
 
+        let available_threads = std::thread::available_parallelism()?.get();
+        let processing_threads = match (
+            decoder.is_software,
+            encoder.selected_vendor() == ffmpeg_encoder::Vendor::Software,
+        ) {
+            (true, true) => available_threads / 4,
+            (true, _) | (_, true) => available_threads.saturating_sub(4),
+            (false, false) => available_threads.saturating_sub(1),
+        }
+        .max(1);
+
         let decoder_handle = std::thread::spawn(move || decode_thread(decoder, decode_tx));
         let encoder_handle = std::thread::spawn(move || encode_thread(encoder, encode_rx));
 
         let char_atlas = Arc::new(char_atlas);
-        let worker_handles: Vec<_> = (0..std::thread::available_parallelism().unwrap().get() - 2)
+        let worker_handles: Vec<_> = (0..processing_threads)
             .map(|_| {
                 let rx = decode_rx.clone();
                 let tx = encode_tx.clone();

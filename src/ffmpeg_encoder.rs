@@ -2,7 +2,6 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
-    time::Duration,
 };
 
 use ffmpeg_sidecar::paths::ffmpeg_path;
@@ -241,14 +240,13 @@ impl FfmpegEncoder {
         })
     }
 
-    pub fn encode_frame(&mut self, frame: ndarray::Array3<u8>) -> anyhow::Result<()> {
+    pub fn encode_frame(&mut self, frame: Vec<u8>) -> anyhow::Result<()> {
         let expected = (self.width * self.height * 3) as usize;
-        let (rgb, _) = frame.as_standard_layout().to_owned().into_raw_vec_and_offset();
 
         anyhow::ensure!(
-            rgb.len() == expected,
+            frame.len() == expected,
             "frame size mismatch: got {} bytes, expected {} ({}x{}x3)",
-            rgb.len(),
+            frame.len(),
             expected,
             self.width,
             self.height
@@ -258,7 +256,7 @@ impl FfmpegEncoder {
             .stdin
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("encoder already finished"))?;
-        stdin.write_all(&rgb)?;
+        stdin.write_all(&frame)?;
         Ok(())
     }
 
@@ -370,7 +368,7 @@ fn run_probe(codec: Codec, vendor: Vendor, depth: BitDepth) -> bool {
     ffmpeg.args(["-frames:v", "1", "-f", "null", "-"]);
     ffmpeg.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
 
-    util::run_with_timeout(ffmpeg, Duration::from_secs(8))
+    util::run_with_timeout(ffmpeg, util::PROBE_TIMEOUT)
 }
 
 fn create_rate_and_preset_args(

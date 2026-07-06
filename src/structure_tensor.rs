@@ -10,8 +10,8 @@ pub struct CellStructureTensors {
 
 impl CellStructureTensors {
     pub fn new(cell_w: u32, cell_h: u32) -> Self {
-        assert_eq!(cell_w % 2, 0);
-        assert_eq!(cell_h % 2, 0);
+        // assert_eq!(cell_w % 2, 0);
+        // assert_eq!(cell_h % 2, 0);
 
         let subcell_w = cell_w / 2;
         let subcell_h = cell_h / 2;

@@ -28,7 +28,7 @@ const SOBEL_MAX_RECIPROCAL_SQ: f32 = 1.0 / (1020.0 * 1020.0);
 
 #[profiling::function]
 fn try_special(tensors: &CellStructureTensors) -> Option<usize> {
-    const ANGLE_TOLERANCE: f32 = f32::to_radians(30.0);
+    const ANGLE_TOLERANCE: f32 = f32::to_radians(28.0);
     const ALIGNMENT_TOLERANCE: f32 = 0.3;
 
     const THETA_FSLASH: f32 = f32::to_radians(45.0);
@@ -104,8 +104,8 @@ pub fn process_frame(
     debug_output: bool,
 ) -> anyhow::Result<(Vec<usize>, DynamicImage)> {
     let image_luma8 = image.to_luma8();
-    let temp = image.into_rgb8();
-    let image_raw = temp.as_raw();
+    let image = image.into_rgb8();
+    let image_raw = image.as_raw();
 
     let vertical_grad = {
         profiling::scope!("Vertical Sobel");
@@ -270,19 +270,20 @@ pub fn process_frame(
 
                 for dy in 0..cell_h {
                     for dx in 0..cell_w {
-                        let pixel_index = (((y + dy) * img_width_snapped + x + dx) * 3) as usize;
+                        let src_index = (((y + dy) * image.width() + x + dx) * 3) as usize;
+                        let dst_index = (((y + dy) * img_width_snapped + x + dx) * 3) as usize;
 
                         let multiplier = atlas_row[(dy * cell_w + dx) as usize] as f32 / 255.0;
 
-                        let r = unsafe { *image_raw.get_unchecked(pixel_index) };
-                        let g = unsafe { *image_raw.get_unchecked(pixel_index + 1) };
-                        let b = unsafe { *image_raw.get_unchecked(pixel_index + 2) };
+                        let r = unsafe { *image_raw.get_unchecked(src_index) };
+                        let g = unsafe { *image_raw.get_unchecked(src_index + 1) };
+                        let b = unsafe { *image_raw.get_unchecked(src_index + 2) };
 
-                        buffer[pixel_index] =
+                        buffer[dst_index] =
                             unsafe { multiplier.algebraic_mul(r as f32).round().to_int_unchecked::<u8>() };
-                        buffer[pixel_index + 1] =
+                        buffer[dst_index + 1] =
                             unsafe { multiplier.algebraic_mul(g as f32).round().to_int_unchecked::<u8>() };
-                        buffer[pixel_index + 2] =
+                        buffer[dst_index + 2] =
                             unsafe { multiplier.algebraic_mul(b as f32).round().to_int_unchecked::<u8>() };
                     }
                 }
@@ -302,18 +303,15 @@ pub fn char_indices_to_string(
     img_height: usize,
     indices: &[usize],
 ) -> String {
-    let mut chars = String::with_capacity(img_height);
+    let mut chars = String::with_capacity((img_width * img_height) / (cell_w * cell_h));
 
     for y in 0..(img_height / cell_h) {
         for x in 0..(img_width / cell_w) {
             let index = indices[(y * (img_width / cell_w) + x) as usize];
 
             let char = CHARS
-                .iter()
-                .chain(EDGE_CHARS.iter())
-                .enumerate()
-                .find(|(i, _)| *i == index)
-                .map(|(_, c)| c)
+                .get(index)
+                .or_else(|| EDGE_CHARS.get(index - CHARS.len()))
                 .unwrap();
 
             chars.push(*char);

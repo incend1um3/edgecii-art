@@ -1,15 +1,8 @@
-use image::RgbImage;
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
-
-pub fn image_to_frame(img: RgbImage) -> ndarray::Array3<u8> {
-    let (w, h) = img.dimensions();
-    ndarray::Array3::from_shape_vec((h as usize, w as usize, 3), img.into_raw())
-        .expect("buffer size matches dimensions")
-}
 
 /// Run a command to completion (or kill it at `timeout`), returning whether it
 /// exited successfully plus everything it wrote to stderr. Returns `None` on
