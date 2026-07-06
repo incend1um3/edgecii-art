@@ -171,6 +171,7 @@ impl FfmpegEncoder {
         rate: RateControl,
         preferred_vendor: Option<Vendor>,
     ) -> anyhow::Result<Self> {
+        println!("Probing hardware accelerators for encoding...");
         let (vendor, encoder, bit_depth) = select_encoder(codec, preferred_vendor)
             .ok_or_else(|| anyhow::anyhow!("no working encoder found for {codec:?}"))?;
 

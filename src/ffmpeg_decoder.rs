@@ -100,6 +100,7 @@ pub fn create_decoder(file: &Path) -> anyhow::Result<FfmpegVideoDecoder> {
 
     let meta = probe_metadata(file)?;
 
+    println!("Probing hardware accelerators for decoding...");
     let hwaccel = probe_hwaccel(file);
     match hwaccel {
         Some(name) => println!("Using hardware accelerated decoding through {}", name),
@@ -175,7 +176,16 @@ fn probe_metadata(file: &Path) -> anyhow::Result<StreamMetadata> {
         ])
         .arg(file)
         .stdin(Stdio::null())
-        .output()?;
+        .output()
+        .map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "Failed to spawn ffprobe (your ffmpeg installation might be broken): {}",
+                    e
+                ),
+            )
+        })?;
 
     anyhow::ensure!(output.status.success(), "ffprobe failed to read {}", file.display());
 

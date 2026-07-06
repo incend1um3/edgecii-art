@@ -1,10 +1,10 @@
 use clap::Parser;
+use ffmpeg_sidecar::command::ffmpeg_is_installed;
 use ffmpeg_sidecar::download::FfmpegDownloadProgressEvent;
 use image::{DynamicImage, GrayImage, RgbImage};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
-use std::str::FromStr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
@@ -162,6 +162,10 @@ fn process_thread(
 }
 
 fn download_ffmpeg() {
+    if ffmpeg_is_installed() {
+        return;
+    }
+
     ffmpeg_sidecar::download::auto_download_with_progress(|p| {
         let message = match p {
             FfmpegDownloadProgressEvent::Starting => "Starting FFMPEG download...".into(),
@@ -199,6 +203,12 @@ fn main() -> anyhow::Result<()> {
         _ => anyhow::bail!("Unsupported input file format"),
     };
 
+    let input_file_stem = args
+        .input
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "render".to_string());
+
     let (char_atlas, cell_w, cell_h) = render_fonts_to_atlas(args.char_height as u32)?;
 
     if cfg!(debug_assertions) {
@@ -228,9 +238,10 @@ fn main() -> anyhow::Result<()> {
             &char_indices,
         );
 
-        print!("{}", chars);
-        std::fs::write("./output/render.txt", chars)?;
-        image.save("./output/render.png")?;
+        std::fs::write(format!("./output/{input_file_stem}.txt"), chars)?;
+        image.save(format!("./output/{input_file_stem}.png"))?;
+
+        println!("Done. Output saved to ./output/ as {input_file_stem}.png and {input_file_stem}.txt");
     } else {
         download_ffmpeg();
 
@@ -255,7 +266,7 @@ fn main() -> anyhow::Result<()> {
             out_w,
             out_h,
             decoder.frame_rate_rational(),
-            PathBuf::from_str("./output/render.mkv")?,
+            PathBuf::from(format!("./output/{input_file_stem}.mkv")),
             &args.input,
             args.codec,
             args.compression_level,
@@ -294,7 +305,7 @@ fn main() -> anyhow::Result<()> {
         drop(encode_tx);
         encoder_handle.join().unwrap();
 
-        println!("Done");
+        println!("Done. Output saved to ./output/{input_file_stem}.mkv");
     }
 
     Ok(())
