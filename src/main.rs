@@ -117,7 +117,7 @@ fn encode_thread(mut encoder: FfmpegEncoder, rx: mpsc::Receiver<ProcessedFrame>)
 
             if next % 30 == 0 {
                 let fps = 30.0 / timestamp.elapsed().as_secs_f32();
-                print!("Processed {} frames, fps: {:.2}\t\r", next, fps);
+                print!("\r\x1b[KProcessed {} frames, fps: {:.2}", next, fps);
                 std::io::stdout().flush().unwrap();
 
                 timestamp = Instant::now();
@@ -125,6 +125,7 @@ fn encode_thread(mut encoder: FfmpegEncoder, rx: mpsc::Receiver<ProcessedFrame>)
         }
     }
 
+    println!();
     encoder.finish().unwrap();
 }
 
@@ -162,10 +163,6 @@ fn process_thread(
 }
 
 fn download_ffmpeg() {
-    if ffmpeg_is_installed() {
-        return;
-    }
-
     ffmpeg_sidecar::download::auto_download_with_progress(|p| {
         let message = match p {
             FfmpegDownloadProgressEvent::Starting => "Starting FFMPEG download...".into(),
@@ -181,12 +178,10 @@ fn download_ffmpeg() {
             FfmpegDownloadProgressEvent::Done => "Done!\n".into(),
         };
 
-        print!("{}\t\t\t\r", message);
+        print!("\r\x1b[K{}", message);
         let _ = std::io::stdout().flush();
     })
     .unwrap();
-
-    println!();
 }
 
 fn main() -> anyhow::Result<()> {
@@ -197,7 +192,10 @@ fn main() -> anyhow::Result<()> {
     }
     let _ = std::fs::create_dir("./output");
 
-    let is_video = match infer::get_from_path(&args.input)?.map(|t| t.matcher_type()) {
+    let is_video = match infer::get_from_path(&args.input)
+        .map_err(|e| std::io::Error::new(e.kind(), format!("Failed to read input: {}", e)))?
+        .map(|t| t.matcher_type())
+    {
         Some(infer::MatcherType::Video) => true,
         Some(infer::MatcherType::Image) => false,
         _ => anyhow::bail!("Unsupported input file format"),
