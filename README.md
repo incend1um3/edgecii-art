@@ -21,6 +21,7 @@
   <a href="#how-it-works">How it Works</a> •
   <a href="#why-not-x">Why not X?</a> •
   <a href="#video-demo">Video Demo</a> •
+  <a href="#running">Running</a> •
   <a href="#development">Development</a> •
   <a href="#license">License</a>
 </p>
@@ -112,6 +113,26 @@ In my opinion, this already looks way more pleasant than a traditional naive imp
 - Taking into account regions outside of the current cell, the lack of which is the main reason behind flickering edges between frames
 
 Unfortunately, all of these are too slow to run on a CPU and will require a port to a vulkan compute shader.
+
+## Running
+
+Download the binary for your platform from [releases](https://github.com/incend1um3/edgecii-art/releases), then launch it from a **terminal emulator**:
+
+```bash
+# make the binary executable
+chmod +x ./edgecii-art-v0.2.0-linux-x86_64-v3
+
+# list the available options
+./edgecii-art-v0.2.0-linux-x86_64-v3 --help
+
+# run on an image
+./edgecii-art-v0.2.0-linux-x86_64-v3 -i my-image.png --char-height 16
+# run on a video
+./edgecii-art-v0.2.0-linux-x86_64-v3 -i my-video.mp4 --char-height 16
+
+# renders saved in ./output
+ls ./output
+```
 
 ## Development
 
